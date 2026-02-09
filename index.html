@@ -3661,6 +3661,8 @@ body.is-locked::after{
 }
 
 </style>
+<link rel="manifest" href="./manifest.json">
+<meta name="theme-color" content="#0b1220">
 
 </head>
 
@@ -9266,7 +9268,11 @@ window.addEventListener("blur", () => {
   // blur bazen false-positive, yine de istersen kapat:
   // pauseBackgroundWork();
 });
-
+if ("serviceWorker" in navigator) {
+    window.addEventListener("load", () => {
+      navigator.serviceWorker.register("./service-worker.js").catch(console.error);
+    });
+  }
 
     </script>
     <!-- Toast Container -->

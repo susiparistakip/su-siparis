@@ -1,0 +1,6257 @@
+const ADMIN_WHATSAPP_E164 = "905311012925";
+// Örnek: Türkiye için başında + yok: "905551112233"
+function getLoginIdentifier() {
+  // Buraya senin login ekranındaki kullanıcı input id'lerini yazdım.
+  // Hangisi varsa onu alacak.
+  const el =
+    document.getElementById("loginUser") || // varsa
+    document.getElementById("loginName") || // varsa
+    document.getElementById("loginEmail") || // varsa
+    document.getElementById("username") || // varsa
+    document.getElementById("user") || // varsa
+    null;
+
+  const v = (el?.value || "").trim();
+  return v || "Bilinmiyor";
+}
+
+function buildResetMessage() {
+  const typedUser = getLoginIdentifier();
+  const when = new Date().toLocaleString("tr-TR");
+
+  const passVal = (document.getElementById("loginPass")?.value || "").trim();
+  const pinHint = /^\d{4}$/.test(passVal) ? " (4 haneli PIN denedi)" : "";
+
+  return (
+    `Merhaba, şifre/PIN sıfırlama talep ediyorum.\n` +
+    `Kullanıcı: ${typedUser}${pinHint}\n` +
+    `Tarih/Saat: ${when}\n` +
+    `Not: Giriş ekranından yönlendirildim.`
+  );
+}
+
+function openWhatsAppToAdmin() {
+  if (!ADMIN_WHATSAPP_E164 || ADMIN_WHATSAPP_E164.includes("X")) {
+    alert("Admin WhatsApp numarası ayarlanmadı. app.js -> ADMIN_WHATSAPP_E164");
+    return;
+  }
+
+  const text = buildResetMessage();
+  const url = `https://wa.me/${ADMIN_WHATSAPP_E164}?text=${encodeURIComponent(text)}`;
+  window.open(url, "_blank", "noopener,noreferrer");
+}
+
+document
+  .getElementById("btnWaReset")
+  ?.addEventListener("click", openWhatsAppToAdmin);
+
+function showToast(message, type = "info", duration = 2600) {
+  const host = document.getElementById("toastHost");
+  if (!host) return;
+
+  const toast = document.createElement("div");
+  toast.className = `toast ${type}`;
+
+  const icon = type === "success" ? "✅" : type === "error" ? "⚠️" : "ℹ️";
+
+  toast.innerHTML = `<span>${icon}</span><span>${message}</span>`;
+  host.appendChild(toast);
+
+  setTimeout(() => toast.remove(), duration);
+}
+function nudgeAdminResetLink() {
+  const link = document.getElementById("btnWaReset");
+  const inputWrap = document.querySelector("#authModal .ln-input");
+
+  link?.classList.remove("is-alert");
+  inputWrap?.classList.remove("is-shake");
+
+  // reflow trick (anim tekrar oynasın diye)
+  void link?.offsetWidth;
+  void inputWrap?.offsetWidth;
+
+  link?.classList.add("is-alert");
+  inputWrap?.classList.add("is-shake");
+
+  setTimeout(() => {
+    link?.classList.remove("is-alert");
+    inputWrap?.classList.remove("is-shake");
+  }, 1200);
+}
+
+/* ================== AUTH (Login / Signup) ================== */
+const USERS_KEY = "su_users_v1";
+const SESSION_KEY = "su_session_v1";
+function applyPermissions() {
+  const adminOk = isAdminActive();
+  const addOk = canAddOrder();
+
+  // ---- Sipariş ekleme (admin + active user)
+  document.querySelectorAll("[data-perm='add']").forEach((el) => {
+    el.classList.toggle("opacity-50", !addOk);
+    el.style.pointerEvents = addOk ? "" : "none";
+  });
+
+  // ---- Admin-only (ayarlar, silme, kısmi ödeme)
+  document.querySelectorAll("[data-perm='admin']").forEach((el) => {
+    el.style.display = adminOk ? "" : "none";
+  });
+
+  // ---- Pending / passive uyarısı
+  const warn = document.getElementById("pendingWarn");
+  if (warn) {
+    warn.style.display = !adminOk && !addOk ? "block" : "none";
+  }
+}
+
+function loadUsers() {
+  try {
+    return JSON.parse(localStorage.getItem(USERS_KEY) || "[]") || [];
+  } catch {
+    return [];
+  }
+}
+function saveUsers(list) {
+  localStorage.setItem(USERS_KEY, JSON.stringify(list || []));
+}
+const SESSION_TTL_MS = null; // Otomatik süre sonu kapalı. Oturum sadece sekme/uygulama kapanınca düşer.
+
+function getSessionRaw() {
+  try {
+    return JSON.parse(sessionStorage.getItem(SESSION_KEY) || "null");
+  } catch {
+    return null;
+  }
+}
+
+function getSession() {
+  const s = getSessionRaw();
+  if (!s) return null;
+
+  return s;
+}
+
+function setSession(user) {
+  if (!user) {
+    sessionStorage.removeItem(SESSION_KEY);
+    return;
+  }
+  const now = Date.now();
+  const s = {
+    ...user,
+    issuedAt: now,
+    lastActiveAt: now,
+  };
+  sessionStorage.setItem(SESSION_KEY, JSON.stringify(s));
+}
+
+function touchSession() {
+  const s = getSessionRaw();
+  if (!s?.username) return;
+  const now = Date.now();
+  s.lastActiveAt = now;
+  sessionStorage.setItem(SESSION_KEY, JSON.stringify(s));
+}
+
+function clearSession() {
+  sessionStorage.removeItem(SESSION_KEY);
+}
+
+function doLogout() {
+  clearSession(); // su_session_v1 silinir
+  currentUser = null;
+  updateUserChip();
+  location.reload(); // temiz sayfa
+}
+
+function openAuth() {
+  setAppLocked(true);
+  const m = document.getElementById("authModal");
+  if (!m) return;
+  m.classList.remove("hidden");
+  m.setAttribute("aria-hidden", "false");
+}
+function closeAuth() {
+  if (!currentUser?.username) return; // giriş yokken auth kapanmasın
+
+  const m = document.getElementById("authModal");
+  if (!m) return;
+  m.classList.add("hidden");
+  m.setAttribute("aria-hidden", "true");
+}
+
+function setAuthMsg(txt, which = 1) {
+  const el = document.getElementById(which === 1 ? "authMsg" : "authMsg2");
+  if (el) el.textContent = txt || "";
+}
+let currentUser = getSession(); // { username, role, status }
+function bindAutoLogout() {
+  // Otomatik logout tamamen kapalı.
+  // Sekme görünürlüğü değiştiğinde sadece son aktif zamanı tazele.
+  document.addEventListener("visibilitychange", () => {
+    if (!currentUser?.username) return;
+    if (!document.hidden) touchSession();
+  });
+}
+
+bindAutoLogout();
+
+function isAdminActive() {
+  return (
+    currentUser &&
+    currentUser.role === "admin" &&
+    currentUser.status === "active"
+  );
+}
+
+function canAddOrder() {
+  return !!currentUser; // giriş yapan herkes sipariş verebilir
+}
+
+function canAccessSettings() {
+  return isAdminActive(); // sadece admin
+}
+
+function canAddOrder() {
+  return (
+    currentUser &&
+    (currentUser.status || "passive") === "active" &&
+    ((currentUser.role || "user") === "admin" ||
+      (currentUser.role || "user") === "user")
+  );
+}
+
+function updateUserChip() {
+  const t = document.getElementById("userChipText");
+  if (!t) return;
+  if (currentUser?.username) {
+    t.textContent =
+      currentUser.username + (currentUser.role === "admin" ? " (A)" : "");
+  } else {
+    t.textContent = "Giriş";
+  }
+}
+// 🔒 App lock/unlock (minimum fix)
+let __appLocked = false;
+
+function setAppLocked(locked) {
+  document.body.classList.toggle("is-locked", !!locked);
+
+  const app = document.querySelector(".app");
+  if (!app) return;
+
+  app.style.pointerEvents = locked ? "none" : "";
+}
+
+function requireLoginOrOpenAuth() {
+  // giriş varsa devam
+  if (currentUser?.username && currentUser.status !== "passive") return true;
+
+  // giriş yoksa auth aç
+  openAuth();
+  return false;
+}
+
+function initAuthUI() {
+  // backdrop / X
+  document.getElementById("authBg")?.addEventListener("click", closeAuth);
+  document.getElementById("authX")?.addEventListener("click", closeAuth);
+
+  // show/hide password (yeni: göz butonu, eski: switch)
+  const _pw = document.getElementById("loginPass");
+  const _btnShow = document.getElementById("btnShowLogin");
+  const _chkShow = document.getElementById("loginShowPw");
+
+  if (_btnShow && _pw) {
+    _btnShow.addEventListener("click", () => {
+      _pw.type = _pw.type === "password" ? "text" : "password";
+      _pw.focus({ preventScroll: true });
+    });
+  } else if (_chkShow) {
+    _chkShow.addEventListener("change", (e) => {
+      const inp = document.getElementById("loginPass");
+      if (inp) inp.type = e.target.checked ? "text" : "password";
+    });
+  }
+
+  // Signup şifre göster/gizle (opsiyonel)
+  const _btnShowSign = document.getElementById("btnShowSign");
+  const _sp = document.getElementById("signPass");
+  if (_btnShowSign && _sp) {
+    _btnShowSign.addEventListener("click", () => {
+      _sp.type = _sp.type === "password" ? "text" : "password";
+      _sp.focus({ preventScroll: true });
+    });
+  }
+
+  // Tabs (LoginNew) varsa onu kullan, yoksa checkbox’ı kullan (geriye uyumlu)
+  const tabLogin = document.getElementById("tabLogin");
+  const tabSignup = document.getElementById("tabSignup");
+  const loginBox = document.getElementById("authLoginBox");
+  const signupBox = document.getElementById("authSignupBox");
+
+  function setAuthTab(which) {
+    const isLogin = which === "login";
+    if (tabLogin && tabSignup) {
+      tabLogin.classList.toggle("active", isLogin);
+      tabSignup.classList.toggle("active", !isLogin);
+      tabLogin.setAttribute("aria-selected", String(isLogin));
+      tabSignup.setAttribute("aria-selected", String(!isLogin));
+    }
+    if (loginBox) loginBox.style.display = isLogin ? "grid" : "none";
+    if (signupBox) signupBox.style.display = isLogin ? "none" : "grid";
+    setAuthMsg("", 1);
+    setAuthMsg("", 2);
+  }
+
+  if (tabLogin && tabSignup) {
+    tabLogin.addEventListener("click", () => setAuthTab("login"));
+    tabSignup.addEventListener("click", () => setAuthTab("signup"));
+    document
+      .getElementById("btnBackLogin")
+      ?.addEventListener("click", () => setAuthTab("login"));
+    setAuthTab("login");
+  } else {
+    // Üye ol checkbox => signup aç (eski UI)
+    document.getElementById("goSignup")?.addEventListener("change", (e) => {
+      const on = !!e.target.checked;
+      document.getElementById("authLoginBox").style.display = on
+        ? "none"
+        : "grid";
+      document.getElementById("authSignupBox").style.display = on
+        ? "grid"
+        : "none";
+      setAuthMsg("", 1);
+      setAuthMsg("", 2);
+    });
+
+    document.getElementById("btnBackLogin")?.addEventListener("click", () => {
+      const c = document.getElementById("goSignup");
+      if (c) c.checked = false;
+      document.getElementById("authLoginBox").style.display = "grid";
+      document.getElementById("authSignupBox").style.display = "none";
+      setAuthMsg("", 1);
+      setAuthMsg("", 2);
+    });
+  }
+
+  // Login
+
+  // TR uyumlu normalize: İ/i/ı/I sorunlarını azaltır + boşlukları temizler
+  function normUser(s) {
+    return (s || "")
+      .trim()
+      .toUpperCase()
+      .replaceAll("İ", "I")
+      .replaceAll("ı", "I");
+  }
+
+  document.getElementById("btnDoLogin")?.addEventListener("click", async () => {
+    const btn = document.getElementById("btnDoLogin");
+    const btnTxt = btn?.querySelector(".txt");
+
+    const setBtnLoading = (on, text) => {
+      if (!btn) return;
+      btn.classList.toggle("loading", !!on);
+      btn.disabled = !!on;
+
+      // .txt varsa onu yaz
+      if (btnTxt)
+        btnTxt.textContent = text || (on ? "Kontrol ediliyor..." : "Giriş Yap");
+      else btn.textContent = text || (on ? "Kontrol ediliyor..." : "Giriş Yap");
+    };
+
+    // Başta kullanıcıya hızlı feedback ver
+    setBtnLoading(true, "Kontrol ediliyor...");
+
+    // 250ms sonra hâlâ devam ediyorsa “Sunucuya bağlanılıyor…” yazsın
+    const loadingDelay = setTimeout(() => {
+      setBtnLoading(true, "Oturum açılıyor...");
+      setAuthMsg("Oturum açılıyor…", 0);
+    }, 250);
+
+    let loginOk = false;
+
+    try {
+      const uRaw = document.getElementById("loginUser")?.value || "";
+      const p = (document.getElementById("loginPass")?.value || "").trim();
+      const u = normUser(uRaw);
+
+      // 1) boş kontrol
+      if (!u || !p) {
+        setAuthMsg("Kullanıcı adı ve şifre gerekli.", 1);
+        return;
+      }
+
+      // 2) Firebase yapılandırma kontrol
+      if (
+        !FIREBASE_WEB_CONFIG ||
+        !String(FIREBASE_WEB_CONFIG.apiKey || "").trim() ||
+        !String(FIREBASE_WEB_CONFIG.projectId || "").trim()
+      ) {
+        setAuthMsg("Firebase bağlantısı tanımlı değil.", 1);
+        return;
+      }
+
+      // 3) Google’dan kullanıcıları çek
+      const ok = await syncUsersFromSheet({ silent: true }).catch(() => false);
+      if (!ok) {
+        setAuthMsg("Firebase bağlantısına ulaşılamadı. İnternet bağlantını kontrol et.", 1);
+        return;
+      }
+
+      // 4) Cache’ten oku ve kullanıcıyı bul
+      const users = loadUsers() || [];
+      const found = users.find((x) => normUser(x.username) === u);
+
+      if (!found) {
+        setAuthMsg("Bu kullanıcı tanımlı değil.", 1);
+        return;
+      }
+
+      // 5) status kontrol (TEK YER)
+      const st = String(found.status || "pending"); // active | passive | pending
+      if (st !== "active") {
+        const msg =
+          st === "passive"
+            ? "Hesabınız pasife alınmıştır. Lütfen admin ile görüşünüz."
+            : "Hesabınız onay bekliyor. Admin onayı olmadan giriş yapılamaz.";
+
+        setAuthMsg(msg, 1);
+        uiOpen({
+          title: st === "passive" ? "Hesap Pasif" : "Onay Bekliyor",
+          subtitle: found.username,
+          body: msg,
+          okText: "Tamam",
+          showCancel: false,
+        });
+        return;
+      }
+
+      // 6) şifre kontrol
+      if (String(found.pass || "") !== String(p)) {
+        setAuthMsg("Şifre hatalı.", 1);
+        nudgeAdminResetLink();
+
+        return;
+      }
+
+      // ✅ BAŞARI NOKTASI (loginOk burada TRUE olmalı)
+      loginOk = true;
+
+      currentUser = {
+        username: found.username,
+        role: found.role,
+        status: "active",
+      };
+      setSession(currentUser);
+      updateUserChip();
+
+      setBtnLoading(true, "Güncel veriler alınıyor...");
+      setAuthMsg("Güncel veriler alınıyor…", 1);
+
+      // Ekranı erken açma
+      setAppLocked(true);
+
+      // İlk açılışta tüm verileri sırayla çek
+      await syncSettingsFromSheet({ silent: true });
+      await syncOrdersFromSheet({ silent: true });
+      await syncPaymentsFromSheet({ silent: true });
+      refreshPaidStateFromPaymentsOnly?.();
+
+      if (typeof startRealtimeSync === "function") {
+        startRealtimeSync();
+      }
+
+      renderSettings?.();
+      renderOrders?.();
+      renderSummary?.();
+      renderPayHistory?.();
+      renderProfile?.();
+      if (typeof renderDebtTable === "function") renderDebtTable();
+
+      setBtnLoading(true, "Bağlandı ✅");
+      setAuthMsg("Giriş başarılı ✅", 1);
+      applyPermissions();
+
+      const navAyar = document.querySelector('.nav-item[data-page="ayarlar"]');
+      if (navAyar) navAyar.style.display = isAdminActive() ? "" : "none";
+
+      setAppLocked(false);
+
+      setTimeout(closeAuth, 250);
+    } finally {
+      clearTimeout(loadingDelay);
+
+      if (!loginOk) {
+        // başarısızsa butonu normale döndür
+        setBtnLoading(false, "Giriş Yap");
+      } else {
+        // başarılıysa "Bağlandı ✓" zaten görünsün, modal kapanacak
+        // burada hiçbir şey yapma
+      }
+    }
+  });
+
+  // ✅ Enter'a basınca login yap (PC + mobil klavye "Go/Done")
+  ["loginUser", "loginPass"].forEach((id) => {
+    document.getElementById(id)?.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        document.getElementById("btnDoLogin")?.click();
+      }
+    });
+  });
+
+  // Signup (herkes user)
+  document.getElementById("btnDoSignup")?.addEventListener("click", () => {
+    const u = (document.getElementById("signUser")?.value || "").trim();
+    const p1 = (document.getElementById("signPass")?.value || "").trim();
+    const p2 = (document.getElementById("signPass2")?.value || "").trim();
+
+    if (!u || !p1 || !p2) {
+      setAuthMsg("Tüm alanları doldur.", 2);
+      return;
+    }
+    if (p1 !== p2) {
+      setAuthMsg("Şifreler aynı değil.", 2);
+      return;
+    }
+    if (u.length < 3) {
+      setAuthMsg("Kullanıcı adı en az 3 karakter olsun.", 2);
+      return;
+    }
+
+    const users = loadUsers();
+    const exists = users.some(
+      (x) => x.username.toLowerCase() === u.toLowerCase(),
+    );
+    if (exists) {
+      setAuthMsg("Bu kullanıcı adı alınmış.", 2);
+      return;
+    }
+
+    const newUser = {
+      id: Date.now(),
+      username: u,
+      pass: p1,
+      role: "user", // 🔒 herkes user
+      status: "pending", // ⏳ herkes onay bekler
+      createdAt: Date.now(),
+    };
+
+    users.push(newUser);
+    saveUsers(users);
+
+    // ✅ Google Sheet'e de yaz
+    addUserToSheet(newUser);
+
+    saveUsers(users);
+
+    setAuthMsg("Üyelik alındı ✅ (Admin onayı bekliyor)", 2);
+  });
+
+  updateUserChip();
+}
+
+function toggleAccountMenu(force) {
+  const m = document.getElementById("accountMenu");
+  if (!m) return;
+
+  if (typeof force === "boolean") {
+    m.classList.toggle("hidden", !force);
+  } else {
+    m.classList.toggle("hidden"); // toggle
+  }
+}
+
+document.getElementById("btnAccount").onclick = (e) => {
+  e.preventDefault();
+  e.stopPropagation();
+
+  // giriş yoksa login aç
+  if (!currentUser?.username) {
+    openAuth();
+
+    return;
+  }
+
+  // giriş varsa menüyü aç/kapat
+  toggleAccountMenu();
+};
+
+document.getElementById("btnLogout").onclick = (e) => {
+  e.preventDefault();
+  e.stopPropagation();
+  doLogoutConfirm();
+
+  toggleAccountMenu(false); // logout’a basınca menü kapansın
+
+  uiConfirm({
+    title: "Çıkış Yapılsın mı?",
+    body: "Oturum kapatılacak.",
+    okText: "Çıkış Yap",
+    cancelText: "Vazgeç",
+    onOk: () => {
+      clearSession();
+      currentUser = null;
+      location.reload();
+      applyPermissions();
+      stopIdleTimer();
+    },
+  });
+};
+
+// dışarı tıklayınca menüyü kapat
+document.addEventListener("click", () => toggleAccountMenu(false));
+
+/* ================== NAV + SAYFA GEÇİŞİ ================== */
+function renderProfile() {
+  const u = currentUser || {};
+  const username = u.username || "-";
+  const role = u.role || "-";
+  const status = u.status || "-";
+
+  document.getElementById("profUsername").textContent = username;
+  document.getElementById("profRole").textContent =
+    role === "admin" ? "Admin" : "Kullanıcı";
+  document.getElementById("profStatus").textContent =
+    status === "active"
+      ? "Aktif"
+      : status === "pending"
+        ? "Onay Bekliyor"
+        : "Pasif";
+
+  // admin ise tabloyu çiz
+  if (isAdminActive()) renderUsersTable();
+}
+function badgeClass(status) {
+  status = status || "pending";
+  return status === "active"
+    ? "active"
+    : status === "passive"
+      ? "passive"
+      : "pending";
+}
+function renderUsersTable() {
+  if (!isAdminActive()) return;
+
+  const users = loadUsers();
+
+  const tbody = document.getElementById("usersTbody");
+  document.getElementById("passiveTbody")?.addEventListener("click", (e) => {
+    const btn = e.target.closest("button[data-act]");
+    if (!btn) return;
+    if (!isAdminActive()) return;
+
+    const act = btn.dataset.act;
+    const username = btn.dataset.user;
+
+    const users = loadUsers();
+    const u = users.find((x) => x.username === username);
+    if (!u) return;
+
+    if (act === "activate") u.status = "active";
+    setUserStatusOnSheet(username, "active")
+      .then(() => syncUsersFromSheet({ silent: true }))
+      .catch(console.warn);
+
+    saveUsers(users);
+    renderUsersTable();
+  });
+
+  const info = document.getElementById("usersInfo");
+
+  const passiveTbody = document.getElementById("passiveTbody");
+  const passiveInfo = document.getElementById("passiveInfo");
+
+  if (!tbody) return;
+
+  tbody.innerHTML = "";
+  if (passiveTbody) passiveTbody.innerHTML = "";
+
+  const pendingCount = users.filter(
+    (u) => (u.status || "pending") === "pending",
+  ).length;
+  const passiveCount = users.filter(
+    (u) => (u.status || "pending") === "passive",
+  ).length;
+
+  if (info)
+    info.textContent = `Toplam: ${users.length} • Bekleyen: ${pendingCount}`;
+  if (passiveInfo) passiveInfo.textContent = `${passiveCount}`;
+
+  // 1) Ana tablo: passive OLMAYANLAR (active + pending)
+  const mainUsers = users.filter((u) => (u.status || "pending") !== "passive");
+
+  mainUsers.forEach((u) => {
+    const username = u.username || "";
+    const roleText = (u.role || "user") === "admin" ? "Admin" : "Kullanıcı";
+    const status = u.status || "pending";
+
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+  <td data-label="Kullanıcı" class="u-td">
+    <button type="button" class="user-link" data-act="pw" data-user="${username}">${username}</button>
+  </td>
+
+  <td data-label="Rol" class="u-td">${roleText}</td>
+
+  <td data-label="Durum" class="u-td">
+    <span class="badge ${badgeClass(status)}">${statusLabel(status)}</span>
+  </td>
+
+  <td data-label="İşlem" class="u-td">
+    <div class="u-actions">
+      ${
+        status === "pending"
+          ? `<button class="btn btn-ok" data-act="approve" data-user="${username}">Onayla</button>`
+          : ``
+      }
+      ${
+        roleText === "Admin"
+          ? ``
+          : `<button class="mini-btn" data-act="passive" data-user="${username}">Pasif Yap</button>`
+      }
+    </div>
+  </td>
+`;
+
+    tbody.appendChild(tr);
+  });
+
+  // 2) Pasif tablo: sadece passive olanlar
+  const passives = users.filter((u) => (u.status || "pending") === "passive");
+
+  passives.forEach((u) => {
+    const username = u.username || "";
+    const roleText = (u.role || "user") === "admin" ? "Admin" : "Kullanıcı";
+    const status = u.status || "passive";
+
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+            <td data-label="Kullanıcı" class="u-td u-name">${username}</td>
+            <td data-label="Rol" class="u-td">${roleText}</td>
+            <td data-label="Durum" class="u-td">
+                <span class="badge ${badgeClass(status)}">${statusLabel(status)}</span>
+            </td>
+            <td data-label="İşlem" class="u-td">
+                <div class="u-actions">
+                <button class="btn btn-ok" data-act="activate" data-user="${username}">Aktif Yap</button>
+                </div>
+            </td>
+            `;
+
+    passiveTbody?.appendChild(tr);
+  });
+}
+function renderPassiveUsers() {
+  if (!isAdminActive()) return;
+
+  const users = loadUsers();
+  const passives = users.filter((u) => (u.status || "pending") === "passive");
+
+  const passiveInfo = document.getElementById("passiveInfo");
+  const passiveTbody = document.getElementById("passiveTbody");
+
+  if (passiveInfo) passiveInfo.textContent = String(passives.length);
+  if (!passiveTbody) return;
+
+  passiveTbody.innerHTML = "";
+
+  passives.forEach((u) => {
+    const username = u.username || "";
+    const roleText = (u.role || "user") === "admin" ? "Admin" : "Kullanıcı";
+
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td style="padding:10px; font-weight:700;">${username}</td>
+      <td style="padding:10px;">${roleText}</td>
+      <td style="padding:10px;"><span class="badge ${badgeClass("passive")}">${statusLabel("passive")}</span></td>
+      <td style="padding:10px;">
+        <div style="display:flex; gap:8px; flex-wrap:wrap;">
+          <button class="btn btn-ok" data-act="activate" data-user="${username}">Aktif Yap</button>
+        </div>
+      </td>
+    `;
+    passiveTbody.appendChild(tr);
+  });
+}
+document.getElementById("btnPassiveRefresh")?.addEventListener("click", () => {
+  renderPassiveUsers();
+});
+
+document.getElementById("passiveTbody")?.addEventListener("click", (e) => {
+  const btn = e.target.closest("button[data-act]");
+  if (!btn) return;
+  if (!isAdminActive()) return;
+
+  const act = btn.dataset.act;
+  const username = btn.dataset.user;
+
+  if (act !== "activate") return;
+
+  const users = loadUsers();
+  const u = users.find((x) => x.username === username);
+  if (!u) return;
+
+  u.status = "active";
+  setUserStatusOnSheet(username, "active")
+    .then(() => syncUsersFromSheet({ silent: true }))
+    .catch(console.warn);
+
+  saveUsers(users);
+
+  renderPassiveUsers();
+  if (typeof renderUsersTable === "function") renderUsersTable(); // kullanıcı yönetimini de güncellesin
+});
+
+// Profil > Kullanıcı Yönetimi sayfasına geç
+document.getElementById("btnGoUsersPage")?.addEventListener("click", () => {
+  if (!isAdminActive()) return;
+  showPage("users");
+  if (typeof renderUsersTable === "function") renderUsersTable();
+});
+
+document.getElementById("btnGoPassivePage")?.addEventListener("click", () => {
+  if (!isAdminActive()) return;
+  showPage("passive");
+  if (typeof renderPassiveUsers === "function") renderPassiveUsers();
+});
+
+// Kullanıcı Yönetimi > Profile dön
+document.getElementById("btnUsersBack")?.addEventListener("click", () => {
+  showPage("profil");
+});
+
+// Yenile butonu
+document.getElementById("btnUsersRefresh")?.addEventListener("click", () => {
+  renderUsersTable();
+});
+
+function statusLabel(status) {
+  status = status || "pending";
+  return status === "active"
+    ? "Aktif"
+    : status === "passive"
+      ? "Pasif"
+      : "Onay Bekliyor";
+}
+
+document.getElementById("usersTbody")?.addEventListener("click", (e) => {
+  const btn = e.target.closest("button[data-act]");
+  if (!btn) return;
+  if (!isAdminActive()) return;
+
+  const act = btn.dataset.act;
+  const username = btn.dataset.user;
+
+  const users = loadUsers();
+  const u = users.find((x) => x.username === username);
+  if (!u) return;
+
+  // admin kendi hesabını pasif yapamasın
+  if (currentUser?.username === username && act === "passive") {
+    uiOpen({
+      title: "Uyarı",
+      subtitle: "Kendi hesabını pasif yapamazsın",
+      body: "Admin hesabı pasife çekilemez.",
+      okText: "Tamam",
+      showCancel: false,
+    });
+    return;
+  }
+
+  // --- Şifre değiştir (username'e tıklayınca) ---
+  if (act === "pw") {
+    uiOpen({
+      title: "Şifre Değiştir",
+      subtitle: `Kullanıcı: ${username}`,
+      body: `
+        <div class="field" style="margin-top:6px;">
+            <label>Yeni Şifre</label>
+            <input id="adminPwNew" type="password" placeholder="Yeni şifre">
+        </div>
+        <label style="display:flex;align-items:center;gap:8px;margin-top:10px;font-size:12px;color:rgba(156,163,175,.95);">
+            <input id="adminPwShow" type="checkbox"> Şifreyi göster
+        </label>
+        <div class="hint" style="margin-top:8px;">Not: Eski şifre gösterilmez, admin yeni şifre atar.</div>
+        `,
+      okText: "Kaydet",
+      cancelText: "Vazgeç",
+      onOk: () => {
+        const newPass = (
+          document.getElementById("adminPwNew")?.value || ""
+        ).trim();
+        if (!newPass) {
+          showToast?.("Şifre boş olamaz", "error");
+          return;
+        }
+
+        const users2 = loadUsers();
+        const uu = users2.find((x) => x.username === username);
+        if (!uu) {
+          showToast?.("Kullanıcı bulunamadı", "error");
+          return;
+        }
+
+        uu.pass = newPass; // yeni şifre set
+        saveUsers(users2);
+        setUserPasswordOnSheet(username, newPass)
+          .then(() => syncUsersFromSheet({ silent: true }))
+          .catch(console.warn);
+
+        showToast?.("Şifre güncellendi ✅", "success");
+        renderUsersTable();
+      },
+    });
+
+    // show/hide
+    setTimeout(() => {
+      document
+        .getElementById("adminPwShow")
+        ?.addEventListener("change", (ev) => {
+          const inp = document.getElementById("adminPwNew");
+          if (inp) inp.type = ev.target.checked ? "text" : "password";
+        });
+    }, 0);
+
+    return;
+  }
+
+  let newStatus = u.status || "pending";
+  if (act === "approve") newStatus = "active";
+  if (act === "passive") newStatus = "passive";
+  if (act === "activate") newStatus = "active";
+
+  u.status = newStatus;
+
+  // önce cache'i güncelle
+  saveUsers(users);
+  renderUsersTable();
+
+  // sonra Google'a yaz ve tekrar sync çek
+  setUserStatusOnSheet(username, newStatus)
+    .then(() => syncUsersFromSheet({ silent: true }))
+    .then(() => renderUsersTable())
+    .catch(console.warn);
+});
+
+// Dashboard parçaları (şu an dashboard = summary-section + action-row)
+const dashboardParts = [
+  document.querySelector(".summary-section"),
+  document.querySelector(".action-row"),
+];
+
+const pages = {
+  dashboard: null,
+  siparisler: document.getElementById("page-siparisler"),
+  raporlar: document.getElementById("page-raporlar"),
+  ayarlar: document.getElementById("page-ayarlar"),
+  profil: document.getElementById("pageProfil"),
+  users: document.getElementById("page-users"),
+  passive: document.getElementById("page-passive"),
+};
+
+initAuthUI();
+applyPermissions();
+
+// ilk açılışta giriş yoksa direkt aç
+
+if (!currentUser) openAuth();
+
+function closeAllAccordions() {
+  document
+    .querySelectorAll("details.acc[open]")
+    .forEach((d) => (d.open = false));
+}
+
+function closeAllDropMenus() {
+  document
+    .querySelectorAll(".drop-menu.open")
+    .forEach((m) => m.classList.remove("open"));
+}
+// ✅ Ayarlar: aynı anda sadece 1 accordion açık kalsın
+let _accGlobalListenersBound = false;
+
+function setupExclusiveAccordions() {
+  const accs = Array.from(document.querySelectorAll("details.acc"));
+
+  accs.forEach((acc) => {
+    acc.addEventListener("toggle", () => {
+      if (!acc.open) return;
+      accs.forEach((other) => {
+        if (other !== acc) other.open = false;
+      });
+    });
+  });
+
+  if (!_accGlobalListenersBound) {
+    _accGlobalListenersBound = true;
+
+    document.addEventListener("click", (e) => {
+      const inside = e.target.closest?.("#accountMenu, #btnAccount");
+      if (!inside) toggleAccountMenu(false);
+    });
+
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape") toggleAccountMenu(false);
+    });
+  }
+}
+
+// sayfa ilk açılırken aktif et
+setupExclusiveAccordions();
+// ✅ Uygulama açılır açılmaz users'ı çek
+// ✅ Uygulama açılır açılmaz users'ı çek
+async function bootUsers() {
+  const s = getSession?.();
+
+  // İlk açılışta ekran kilitli kalsın, eski veri görünmesin
+  setAppLocked(true);
+
+  if (!s?.username) {
+    currentUser = null;
+    openAuth();
+    return;
+  }
+
+  try {
+    // 1) Kullanıcıyı doğrula
+    const okUsers = await syncUsersFromSheet({ silent: true });
+    if (!okUsers) {
+      clearSession?.();
+      currentUser = null;
+      openAuth();
+      setAuthMsg("Kullanıcı bilgileri alınamadı. Tekrar giriş yap.");
+      return;
+    }
+
+    const u = (loadUsers() || []).find((x) => x.username === s.username);
+    if (!u || (u.status || "pending") !== "active") {
+      clearSession?.();
+      currentUser = null;
+      openAuth();
+      setAuthMsg("Hesabın aktif değil veya bulunamadı");
+      return;
+    }
+
+    currentUser = {
+      username: u.username,
+      role: u.role,
+      status: u.status,
+    };
+
+    setSession(currentUser);
+    updateUserChip();
+    applyPermissions?.();
+
+    // 2) İlk güncel verileri sırayla çek
+    await syncSettingsFromSheet?.({ silent: true });
+    await syncOrdersFromSheet?.({ silent: true });
+    await syncPaymentsFromSheet?.({ silent: true });
+    refreshPaidStateFromPaymentsOnly?.();
+
+    // 3) Canlı senkronu başlat
+    if (typeof startRealtimeSync === "function") {
+      startRealtimeSync();
+    }
+
+    // 4) İlk render artık güncel veriyle yapılsın
+    renderSettings?.();
+    renderOrders?.();
+    renderSummary?.();
+    renderPayHistory?.();
+    renderProfile?.();
+    if (typeof renderDebtTable === "function") renderDebtTable();
+
+    // 5) Ekranı aç
+    setAppLocked(false);
+    closeAuth?.();
+  } catch (e) {
+    console.warn("bootUsers error:", e);
+    clearSession?.();
+    currentUser = null;
+    openAuth();
+    setAuthMsg("Açılışta güncel veriler alınamadı. Tekrar giriş yap.");
+  }
+}
+
+window.addEventListener("DOMContentLoaded", bootUsers);
+
+async function syncSettingsFromSheet(opts = { silent: false }) {
+  try {
+    const res = await gsPost({ action: "getSettings" });
+    if (!res?.ok) throw new Error(res?.message || "getSettings başarısız");
+
+    const s = res.data || {};
+    settings = {
+      priceDamacana: Number(s.priceDamacana || 0),
+      pricePet05: Number(s.pricePet05 || 0),
+      firmaAdi: String(s.firmaAdi || "").trim(),
+      whatsapp: String(s.whatsapp || "").trim(),
+    };
+
+    saveSettings(settings);
+
+    document.getElementById("inpPriceDamacana") &&
+      (document.getElementById("inpPriceDamacana").value =
+        settings.priceDamacana || "");
+    document.getElementById("inpPricePet05") &&
+      (document.getElementById("inpPricePet05").value =
+        settings.pricePet05 || "");
+    document.getElementById("inpFirmaAdi") &&
+      (document.getElementById("inpFirmaAdi").value = settings.firmaAdi || "");
+    document.getElementById("inpWhatsapp") &&
+      (document.getElementById("inpWhatsapp").value = settings.whatsapp || "");
+
+    // silent açılışta render yapma
+    if (!opts.silent) {
+      renderSettings?.();
+      renderOrders?.();
+      renderSummary?.();
+      if (typeof renderDebtTable === "function") renderDebtTable();
+      showToast?.("Firma ayarları güncellendi ✅", "success");
+    }
+
+    return true;
+  } catch (e) {
+    console.warn("syncSettingsFromSheet", e);
+    if (!opts.silent) showToast?.("Firma ayarları çekilemedi", "error");
+    return false;
+  }
+}
+
+function showPage(key) {
+  // ✅ giriş yoksa uygulamayı kilitle
+  if (!requireLoginOrOpenAuth()) return;
+  // ✅ Ayarlar admin-only
+  if (key === "ayarlar" && !isAdminActive()) {
+    uiOpen({
+      title: "Yetki Yok ⛔",
+      subtitle: "Ayarlar sadece admin",
+      body: "Bu sayfaya sadece admin girebilir.",
+      okText: "Tamam",
+      showCancel: false,
+    });
+    key = "dashboard"; // geri gönder
+  }
+
+  closeAllAccordions();
+  closeAllDropMenus();
+  window.currentPage = key;
+
+  // nav active
+  document
+    .querySelectorAll(".nav-item")
+    .forEach((b) => b.classList.remove("active"));
+  document
+    .querySelector(`.nav-item[data-page="${key}"]`)
+    ?.classList.add("active");
+
+  // dashboard göster/gizle
+  const showDash = key === "dashboard";
+  dashboardParts.forEach((el) => {
+    if (el) el.style.display = showDash ? "" : "none";
+  });
+
+  // diğer sayfalar
+  Object.keys(pages).forEach((k) => {
+    if (k === "dashboard") return;
+    const el = pages[k];
+    if (!el) return;
+    el.classList.toggle("hidden", k !== key);
+  });
+
+  if (key === "raporlar") renderReports();
+  // ✅ Raporlar hariç sayfalarda yukarı-aşağı kaydırmayı kapat
+  document.body.style.overflowY = key === "raporlar" ? "auto" : "hidden";
+  document.body.style.overscrollBehaviorY = "none";
+
+  renderBugunTarih();
+}
+
+// ===== AUTO REFRESH (admin + sadece ön planda) =====
+let autoRefreshTimer = null;
+
+// istersen süreyi buradan yönet
+const AUTO_REFRESH_MS = 180 * 1000; // 1 dk (senin yorumun bu)
+// ŞU AN 15*1000 yazmışsın; 1 dk istiyorsan bunu kullanacağız.
+
+function startAutoRefresh() {
+  stopAutoRefresh();
+
+  autoRefreshTimer = setInterval(async () => {
+    // ✅ login yoksa çalışmasın
+    if (!currentUser?.username) return;
+
+    // ✅ sadece admin çalışsın (user internet yemesin)
+    if (!isAdminActive?.()) return;
+
+    // ✅ sekme görünmezse / home’a basıldıysa çalışmasın
+    if (document.hidden) return;
+
+    // ✅ (opsiyonel) login ekranındaysa zaten çalışmasın
+    if (document.body.classList.contains("is-locked")) return;
+
+    try {
+      await syncOrdersFromSheet?.();
+      setOrdersLastSync?.(new Date());
+
+      await syncPaymentsFromSheet?.();
+      setPayLastSync?.(new Date());
+
+      // UI güncelle
+      renderOrders?.();
+      renderSummary?.();
+      if (typeof renderDebtTable === "function") renderDebtTable();
+      renderPayHistory?.();
+    } catch (e) {
+      console.warn("AUTO REFRESH FAIL:", e);
+    }
+  }, AUTO_REFRESH_MS);
+}
+// ===== BACKGROUND PAUSE / RESUME =====
+function pauseBackgroundWork() {
+  stopAutoRefresh();
+}
+
+function resumeForegroundWork() {
+  // login varsa ve adminse tekrar başlat
+  if (!currentUser?.username) return;
+  if (document.body.classList.contains("is-locked")) return;
+
+  startAutoRefresh();
+}
+
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) pauseBackgroundWork();
+  else resumeForegroundWork();
+});
+
+// mobilde ekstra garanti
+window.addEventListener("pagehide", pauseBackgroundWork);
+window.addEventListener("focus", resumeForegroundWork);
+
+function stopAutoRefresh() {
+  if (autoRefreshTimer) clearInterval(autoRefreshTimer);
+  autoRefreshTimer = null;
+}
+
+document.querySelectorAll(".nav-item").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    const key = btn.dataset.page;
+
+    if (!pages[key] && key !== "dashboard") {
+      showPage("dashboard");
+      return;
+    }
+
+    showPage(key);
+
+    if (key === "profil") {
+      renderProfile();
+    }
+  });
+});
+
+// ilk açılış
+
+showPage("dashboard");
+renderBugunTarih();
+if (currentUser?.username) {
+  renderProfile();
+}
+
+/* ================== AYARLAR (localStorage) ================== */
+const SETTINGS_KEY = "suSiparis_settings_v1";
+/* ================== SİPARİŞ SİSTEMİ ================== */
+const ORDERS_KEY = "suSiparis_orders_v1";
+/* ================== ÖDEME GEÇMİŞİ ================== */
+const PAYMENTS_KEY = "suSiparis_payments_v1";
+/* ================== YEDEKLEME (JSON Export/Import) ================== */
+const BACKUP_FILE_NAME = "su_siparis_backup.json";
+const BACKUP_VERSION = 1;
+
+function buildBackupObject() {
+  return {
+    version: BACKUP_VERSION,
+    exportedAt: new Date().toISOString(),
+    app: "su_siparis_takip",
+    settings: loadSettings(),
+    orders: loadOrders(),
+    payments: loadPayments(),
+  };
+}
+/* ================== OTOMATİK KAYIT DOSYASI (HANDLE) ================== */
+const BACKUP_HANDLE_DB = "suSiparisBackupDB_v1";
+const BACKUP_HANDLE_STORE = "handles";
+const BACKUP_HANDLE_KEY = "yedekFileHandle";
+const AUTO_BACKUP_LAST_OK_KEY = "autoBackupLastOkDate";
+
+function idbOpenBackup() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(BACKUP_HANDLE_DB, 1);
+    req.onupgradeneeded = () => {
+      const db = req.result;
+      if (!db.objectStoreNames.contains(BACKUP_HANDLE_STORE)) {
+        db.createObjectStore(BACKUP_HANDLE_STORE);
+      }
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+async function autoRefreshOrders() {
+  console.log("⏱️ AUTO ORDERS REFRESH", new Date().toLocaleTimeString());
+
+  await syncOrdersFromSheet();
+  setOrdersLastSync(new Date());
+}
+
+async function autoRefreshPayments() {
+  console.log("⏱️ AUTO PAYMENTS REFRESH", new Date().toLocaleTimeString());
+
+  await syncPaymentsFromSheet();
+  setPayLastSync(new Date());
+}
+
+async function idbSetBackup(key, value) {
+  const db = await idbOpenBackup();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(BACKUP_HANDLE_STORE, "readwrite");
+    tx.objectStore(BACKUP_HANDLE_STORE).put(value, key);
+    tx.oncomplete = () => resolve(true);
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+async function idbGetBackup(key) {
+  const db = await idbOpenBackup();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(BACKUP_HANDLE_STORE, "readonly");
+    const req = tx.objectStore(BACKUP_HANDLE_STORE).get(key);
+    req.onsuccess = () => resolve(req.result || null);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function idbDelBackup(key) {
+  const db = await idbOpenBackup();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(BACKUP_HANDLE_STORE, "readwrite");
+    tx.objectStore(BACKUP_HANDLE_STORE).delete(key);
+    tx.oncomplete = () => resolve(true);
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+async function pickBackupFileOnce() {
+  if (!window.showSaveFilePicker) {
+    uiOpen({
+      title: "Desteklenmiyor",
+      subtitle: "Bu tarayıcı/ortam tek dosyaya yazmayı desteklemiyor.",
+      body: "Çözüm: Chrome/Edge ile aç ve tekrar dene. Destek yoksa sadece indirme yöntemi çalışır.",
+      okText: "Tamam",
+      showCancel: false,
+    });
+    return;
+  }
+
+  try {
+    const handle = await window.showSaveFilePicker({
+      suggestedName: "su_siparis_yedek.json",
+      types: [
+        { description: "JSON", accept: { "application/json": [".json"] } },
+      ],
+    });
+
+    await idbSetBackup(BACKUP_HANDLE_KEY, handle);
+    showToast(
+      "Yedek dosyası seçildi ✅ Artık aynı dosyanın üstüne yazılacak.",
+      "success",
+    );
+    await updateBackupFileStatus();
+  } catch (e) {
+    // iptal edilirse sessiz geç
+    console.warn("Dosya seçimi iptal/başarısız:", e);
+  }
+}
+
+async function writeBackupToPickedFile(jsonText) {
+  const handle = await idbGetBackup(BACKUP_HANDLE_KEY);
+  if (!handle) return false;
+
+  try {
+    // bazı cihazlarda izin tekrar isteyebilir
+    if (handle.requestPermission) {
+      const p = await handle.requestPermission({ mode: "readwrite" });
+      if (p !== "granted") return false;
+    }
+
+    const writable = await handle.createWritable();
+    await writable.write(jsonText);
+    await writable.close();
+    localStorage.setItem(AUTO_BACKUP_LAST_OK_KEY, new Date().toISOString());
+    return true;
+    updateAutoBackupDot();
+  } catch (e) {
+    console.warn("Seçili dosyaya yazılamadı:", e);
+    return false;
+  }
+}
+
+async function updateBackupFileStatus() {
+  const el = document.getElementById("backupFileStatus");
+  if (!el) return;
+  const handle = await idbGetBackup(BACKUP_HANDLE_KEY);
+  if (!handle) {
+    el.textContent = "Dosya seçilmedi.";
+    return;
+  }
+  // name her ortamda yok, o yüzden garanti metin:
+  el.textContent = "Seçili ✅ Günlük otomatik yedek bu dosyanın üstüne yazar.";
+}
+
+async function downloadBackupJson() {
+  const dataObj = buildBackupObject();
+  const json = JSON.stringify(dataObj, null, 2);
+  // ✅ 0) Eğer Ayarlardan dosya seçildiyse, aynı dosyanın üstüne yaz
+  const ok = await writeBackupToPickedFile(json);
+  if (ok) {
+    showToast("Yedek seçili dosyaya yazıldı ✅", "success");
+    return;
+  }
+
+  // 1) File System Access API varsa: aynı dosyanın üstüne yazma şansı (en iyi çözüm)
+  if (window.showSaveFilePicker) {
+    try {
+      const handle = await window.showSaveFilePicker({
+        suggestedName: BACKUP_FILE_NAME,
+        types: [
+          {
+            description: "JSON",
+            accept: { "application/json": [".json"] },
+          },
+        ],
+      });
+
+      const writable = await handle.createWritable();
+      await writable.write(json);
+      await writable.close();
+
+      uiOpen({
+        title: "Yedek Alındı ✅",
+        subtitle: "Dosyaya kaydedildi",
+        body: `Dosya: ${BACKUP_FILE_NAME}\nTarih: ${new Date().toLocaleString("tr-TR")}`,
+        okText: "Tamam",
+        showCancel: false,
+      });
+      showToast("Yedek indirildi ✅", "success");
+      return;
+    } catch (err) {
+      // kullanıcı vazgeçtiyse sessiz geçebiliriz
+      if (String(err).includes("AbortError")) return;
+      // hata olduysa aşağıdaki klasik indirmeye düş
+      console.warn("showSaveFilePicker hata, klasik indirmeye düşüldü:", err);
+    }
+  }
+
+  // 2) Klasik indirme (bazı cihazlarda aynı isimle (1) ekleyebilir)
+  const blob = new Blob([json], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = BACKUP_FILE_NAME;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1200);
+
+  uiOpen({
+    title: "Yedek İndirildi ✅",
+    subtitle: "İndirilenler klasörünü kontrol et",
+    body: `Dosya: ${BACKUP_FILE_NAME}\nNot: Bazı telefonlar aynı isimde (1) ekleyebilir.`,
+    okText: "Tamam",
+    showCancel: false,
+  });
+}
+
+function applyBackupObject(obj) {
+  if (!obj || typeof obj !== "object") throw new Error("Geçersiz JSON");
+
+  const ver = Number(obj.version || 0);
+  if (!ver) throw new Error("Yedek sürümü bulunamadı");
+
+  const newSettings = obj.settings || {};
+  const newOrders = Array.isArray(obj.orders) ? obj.orders : [];
+  const newPayments = Array.isArray(obj.payments) ? obj.payments : [];
+
+  // localStorage’a bas
+  saveSettings({
+    priceDamacana: Number(newSettings.priceDamacana || 0),
+    pricePet05: Number(newSettings.pricePet05 || 0),
+    whatsapp: String(newSettings.whatsapp || "90"),
+    firmaAdi: String(newSettings.firmaAdi || "ABDULLAH ÖZER"),
+  });
+  saveOrders(newOrders);
+  localStorage.setItem(PAYMENTS_KEY, JSON.stringify(newPayments));
+  savePayments(newPayments);
+
+  // RAM değişkenlerini de güncelle
+  settings = loadSettings();
+  orders = loadOrders();
+  payments = loadPayments();
+
+  // UI yenile
+  renderSettings?.();
+  renderOrders?.();
+  renderSummary?.();
+  if (typeof renderDebtTable === "function") renderDebtTable();
+  if (typeof renderPayHistory === "function") renderPayHistory();
+  if (typeof recomputePaidFromPayments === "function")
+    recomputePaidFromPayments();
+}
+
+function importBackupFromFile(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const text = String(reader.result || "");
+        const obj = JSON.parse(text);
+        applyBackupObject(obj);
+        resolve(true);
+      } catch (e) {
+        reject(e);
+      }
+    };
+    reader.onerror = reject;
+    reader.readAsText(file);
+  });
+}
+
+/* ================== GÜNLÜK OTOMATİK YEDEK ================== */
+const AUTO_BACKUP_ASKED_KEY = "autoBackupAsked_v1";
+const AUTO_BACKUP_ENABLED_KEY = "autoBackupEnabled_v1"; // "1" açık
+const AUTO_BACKUP_LAST_YMD_KEY = "autoBackupLastYmd_v1";
+const AUTO_BACKUP_LAST_OK_AT_KEY = "autoBackupLastOkAt_v1"; // son başarılı yedek zamanı
+
+function ymdNow() {
+  const d = new Date();
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+function updateLastBackupInfoUI() {
+  const el = document.getElementById("backupLastInfo");
+  if (!el) return;
+
+  const iso = localStorage.getItem(AUTO_BACKUP_LAST_OK_AT_KEY);
+  if (!iso) {
+    el.textContent = "Son yedek: --";
+    return;
+  }
+
+  const d = new Date(iso);
+  el.textContent = `Son yedek: ${d.toLocaleString("tr-TR")}`;
+}
+
+function isAutoBackupEnabled() {
+  return localStorage.getItem(AUTO_BACKUP_ENABLED_KEY) === "1";
+}
+
+// ✅ btnAccount'a daha önce bağlanan TÜM event'leri sıfırla ve yeniden bağla
+(function rebindAccountChipFresh() {
+  const oldBtn = document.getElementById("btnAccount");
+  if (!oldBtn) return;
+
+  // Butonu clone'la -> tüm eski listener'lar gider
+  const newBtn = oldBtn.cloneNode(true);
+  oldBtn.parentNode.replaceChild(newBtn, oldBtn);
+
+  // Menü aç/kapat yardımcı
+  function showAccountMenu(show) {
+    const m = document.getElementById("accountMenu");
+    if (!m) return;
+    m.classList.toggle(
+      "hidden",
+      show === false
+        ? true
+        : show === true
+          ? false
+          : m.classList.contains("hidden")
+            ? false
+            : true,
+    );
+  }
+
+  // Chip tıklanınca: giriş yoksa login, varsa menü
+  newBtn.addEventListener("click", (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+
+    if (!currentUser?.username) {
+      openAuth();
+      return;
+    }
+    // toggle
+    const m = document.getElementById("accountMenu");
+    if (!m) return;
+    m.classList.toggle("hidden");
+  });
+
+  // Dışarı tıklayınca menüyü kapat
+  document.addEventListener("click", (e) => {
+    const menu = document.getElementById("accountMenu");
+    const btn = document.getElementById("btnAccount");
+
+    // Menü veya buton içindeyse KAPATMA
+    if (menu && (menu.contains(e.target) || btn.contains(e.target))) return;
+
+    if (menu) menu.classList.add("hidden");
+  });
+})();
+
+/* Buton bağla */
+/* ================== Yedekleme Menüleri (JSON / EXCEL) ================== */
+function toggleMenu(menuId) {
+  const el = document.getElementById(menuId);
+  if (!el) return;
+  // diğer menüleri kapat
+  ["menuJson", "menuExcel"].forEach((id) => {
+    if (id !== menuId) document.getElementById(id)?.classList.remove("open");
+  });
+  el.classList.toggle("open");
+}
+
+// dışarı tıklayınca menü kapansın
+document.addEventListener("click", (e) => {
+  const t = e.target;
+  const insideDrop = t?.closest?.(".drop");
+  if (!insideDrop) {
+    document.getElementById("menuJson")?.classList.remove("open");
+    document.getElementById("menuExcel")?.classList.remove("open");
+  }
+});
+
+// Menü aç/kapat
+document.getElementById("btnDropJson")?.addEventListener("click", (e) => {
+  e.preventDefault();
+  e.stopPropagation();
+  toggleMenu("menuJson");
+});
+document.getElementById("btnDropExcel")?.addEventListener("click", (e) => {
+  e.preventDefault();
+  e.stopPropagation();
+  toggleMenu("menuExcel");
+});
+
+/* ---------- JSON Export/Import ---------- */
+document.getElementById("btnJsonExport")?.addEventListener("click", () => {
+  document.getElementById("menuJson")?.classList.remove("open");
+  downloadBackupJson();
+});
+
+document.getElementById("btnJsonImport")?.addEventListener("click", () => {
+  document.getElementById("menuJson")?.classList.remove("open");
+  document.getElementById("backupFileJson")?.click();
+});
+
+document
+  .getElementById("backupFileJson")
+  ?.addEventListener("change", async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    try {
+      await importBackupFromFile(file);
+      uiOpen({
+        title: "Yedek Yüklendi ✅",
+        subtitle: "Veriler geri yüklendi",
+        body: `Dosya: ${file.name}\nTarih: ${new Date().toLocaleString("tr-TR")}`,
+        okText: "Tamam",
+        showCancel: false,
+      });
+      showToast("Yedek Yüklendi ✅", "success");
+    } catch (err) {
+      uiOpen({
+        title: "Yedek Yüklenemedi ❌",
+        subtitle: "JSON formatı hatalı olabilir",
+        body: String(err),
+        okText: "Tamam",
+        showCancel: false,
+      });
+      showToast("Yedek yüklenemedi ❌", "error");
+    } finally {
+      e.target.value = "";
+    }
+  });
+document
+  .getElementById("btnPickBackupFile")
+  ?.addEventListener("click", async () => {
+    await pickBackupFileOnce();
+  });
+
+document
+  .getElementById("btnClearBackupFile")
+  ?.addEventListener("click", async () => {
+    await idbDelBackup(BACKUP_HANDLE_KEY);
+    showToast("Otomatik kayıt dosyası sıfırlandı.", "info");
+    await updateBackupFileStatus();
+  });
+
+/* ---------- EXCEL (.XLSX) Export/Import ---------- */
+
+function isoToYMD(iso) {
+  try {
+    const d = new Date(iso);
+    if (isNaN(d)) return "";
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, "0");
+    const day = String(d.getDate()).padStart(2, "0");
+    return `${y}-${m}-${day}`;
+  } catch {
+    return "";
+  }
+}
+
+function ymdToIso(ymd) {
+  const d = new Date(ymd + "T00:00:00");
+  return isNaN(d) ? new Date().toISOString() : d.toISOString();
+}
+
+function ensureXlsxReady() {
+  if (window.XLSX) return true;
+  showToast?.("Excel modülü yüklenemedi", "error");
+  uiOpen?.({
+    title: "Excel modülü yüklenemedi",
+    subtitle: "İnternet veya dosya engeli olabilir",
+    body: "Sayfayı Ctrl+F5 ile yenileyip tekrar dene.",
+    okText: "Tamam",
+    showCancel: false,
+  });
+  return false;
+}
+
+function productLabel(product) {
+  return product === "damacana" ? "DAMACANA" : "0,5L PET";
+}
+
+function normalizeProductFromLabel(v) {
+  const s = String(v || "").trim().toLowerCase();
+  if (!s) return "damacana";
+  if (s.includes("pet") || s.includes("0,5") || s.includes("05")) return "pet05";
+  return "damacana";
+}
+
+function normalizeSoftDeleteTimestamp(value, fallback = "") {
+  if (!value && value !== 0) return fallback || "";
+  if (typeof value === "number") {
+    const d = new Date(value);
+    return Number.isNaN(d.getTime()) ? (fallback || "") : d.toISOString();
+  }
+  const raw = String(value || "").trim();
+  if (!raw) return fallback || "";
+  if (/^\d+$/.test(raw)) {
+    const d = new Date(Number(raw));
+    return Number.isNaN(d.getTime()) ? (fallback || "") : d.toISOString();
+  }
+  const d = new Date(raw);
+  return Number.isNaN(d.getTime()) ? raw : d.toISOString();
+}
+
+function orderDeletedStamp(item = {}) {
+  if (item?.deletedAt) return normalizeSoftDeleteTimestamp(item.deletedAt);
+  if (item?.isActive === false) {
+    return normalizeSoftDeleteTimestamp(
+      item.updatedAt || item.restoredAt || item.createdAt || item.date || Date.now(),
+    );
+  }
+  return "";
+}
+
+function paymentDeletedStamp(item = {}) {
+  if (item?.deletedAt) return normalizeSoftDeleteTimestamp(item.deletedAt);
+  if (item?.isActive === false) {
+    return normalizeSoftDeleteTimestamp(
+      item.updatedAt || item.restoredAt || item.createdAt || item.date || Date.now(),
+    );
+  }
+  return "";
+}
+
+function getVisiblePayments() {
+  return (payments || []).filter((p) => !paymentDeletedStamp(p));
+}
+
+function getVisibleOrdersSorted(filterFn) {
+  const list = (orders || []).filter((o) => !orderDeletedStamp(o));
+  const filtered = typeof filterFn === "function" ? list.filter(filterFn) : list;
+  return filtered.slice().sort((a, b) => new Date(a.date || 0) - new Date(b.date || 0));
+}
+
+function buildSummaryRowsForOrders(orderList) {
+  const totalQty = orderList.reduce((sum, o) => sum + Number(o.qty || 0), 0);
+  const totalPaidQty = orderList.reduce((sum, o) => sum + Number(o.paidQty || 0), 0);
+  const totalAmount = orderList.reduce(
+    (sum, o) => sum + Number(o.total || Number(o.qty || 0) * Number(o.unitPrice || 0)),
+    0,
+  );
+  const remainingQty = orderList.reduce(
+    (sum, o) => sum + Math.max(0, Number(o.qty || 0) - Number(o.paidQty || 0)),
+    0,
+  );
+
+  return [
+    { Alan: "Rapor Tarihi", Değer: new Date().toLocaleString("tr-TR") },
+    { Alan: "Sipariş Sayısı", Değer: orderList.length },
+    { Alan: "Toplam Adet", Değer: totalQty },
+    { Alan: "Ödenen Adet", Değer: totalPaidQty },
+    { Alan: "Kalan Adet", Değer: remainingQty },
+    { Alan: "Toplam Tutar", Değer: totalAmount },
+  ];
+}
+
+function buildOrderReportRows(filterFn) {
+  return getVisibleOrdersSorted(filterFn).map((o) => {
+    const qty = Number(o.qty || 0);
+    const paid = Number(o.paidQty || 0);
+    const unit = Number(o.unitPrice || 0);
+    const total = Number(o.total || qty * unit);
+    const kalan = Math.max(0, qty - paid);
+    return {
+      ID: String(o.id || ""),
+      Tarih: isoToYMD(o.date),
+      Ürün: productLabel(o.product),
+      Adet: qty,
+      BirimFiyat: unit,
+      Tutar: total,
+      ÖdenenAdet: paid,
+      KalanAdet: kalan,
+      Durum: paid >= qty ? "TAMAMLANDI" : paid > 0 ? "KISMİ" : "BEKLİYOR",
+      Not: String(o.note || ""),
+    };
+  });
+}
+
+function buildPaymentReportRows(filterFn) {
+  const list = getVisiblePayments();
+  const filtered = typeof filterFn === "function" ? list.filter(filterFn) : list;
+  return filtered
+    .slice()
+    .sort((a, b) => new Date(a.date || 0) - new Date(b.date || 0))
+    .map((p) => ({
+      ID: String(p.id || ""),
+      SiparişID: String(p.orderId || ""),
+      Tarih: isoToYMD(p.date),
+      Firma: String(p.firma || settings?.firmaAdi || ""),
+      Adet: Number(p.qty || 0),
+      Tutar: Number(p.amount || 0),
+      Not: String(p.note || ""),
+    }));
+}
+
+function autoFitWorksheetColumns(ws, rows) {
+  const data = Array.isArray(rows) ? rows : [];
+  if (!data.length) {
+    ws["!cols"] = [{ wch: 16 }];
+    return;
+  }
+  const headers = Object.keys(data[0]);
+  ws["!cols"] = headers.map((h) => {
+    let maxLen = String(h).length;
+    for (const row of data) {
+      const len = String(row?.[h] ?? "").length;
+      if (len > maxLen) maxLen = len;
+    }
+    return { wch: Math.min(Math.max(maxLen + 2, 10), 28) };
+  });
+}
+
+function saveWorkbook(workbook, filename) {
+  if (!ensureXlsxReady()) return;
+  window.XLSX.writeFile(workbook, filename);
+}
+
+function exportExcelAllData() {
+  if (!ensureXlsxReady()) return;
+
+  const workbook = window.XLSX.utils.book_new();
+
+  const rawSettingsRows = [{
+    "D-BirimFiyat": Number(settings?.priceDamacana || 0),
+    "P-BirimFiyat": Number(settings?.pricePet05 || 0),
+    "FirmaAdı": String(settings?.firmaAdi || ""),
+    "FirmaWhatsappNO": String(settings?.whatsapp || ""),
+    id: 1,
+    createdAt: new Date().toISOString(),
+    createdBy: String(currentUser?.username || "system"),
+    isActive: true,
+  }];
+  const rawUsersRows = (loadUsers() || []).map((u, index) => ({
+    id: Number(u.id || index + 1),
+    "username ": String(u.username || ""),
+    "password ": String(u.pass ?? u.password ?? ""),
+    "role ": String(u.role || "user"),
+    "status ": String(u.status || "pending"),
+    createdAt: u.createdAt || "",
+  }));
+  const rawOrderRows = (orders || []).slice().sort((a, b) => new Date(a.date || 0) - new Date(b.date || 0)).map((o) => {
+    const qty = Number(o.qty || 0);
+    const paid = Number(o.paidQty || 0);
+    const deletedAt = orderDeletedStamp(o);
+    const isActive = !deletedAt && o.isActive !== false;
+    return {
+      id: Number(o.id || 0),
+      tarih: isoToYMD(o.date),
+      urun: o.product === "damacana" ? "DAMACANA" : "0,5L PET",
+      adet: qty,
+      birimFiyat: Number(o.unitPrice || 0),
+      tutar: Number(o.total || qty * Number(o.unitPrice || 0)),
+      odenenAdet: paid,
+      kalanAdet: Math.max(0, qty - paid),
+      durum: isActive ? (paid >= qty ? "TAMAMLANDI" : paid > 0 ? "KISMİ" : "BEKLİYOR") : "PASIF",
+      createdBy: String(o.createdBy || ""),
+      createdAt: o.createdAt || o.date || "",
+      updatedAt: o.updatedAt || "",
+      deletedAt,
+      isActive,
+    };
+  });
+  const rawPaymentRows = (payments || []).slice().sort((a, b) => new Date(a.date || 0) - new Date(b.date || 0)).map((p) => {
+    const deletedAt = paymentDeletedStamp(p);
+    const isActive = !deletedAt && p.isActive !== false;
+    return {
+      id: Number(p.id || 0),
+      tarih: String(p.date || ""),
+      firma: String(p.firma || settings?.firmaAdi || ""),
+      adet: Number(p.qty || 0),
+      tutarGirilen: Number(p.amount || 0),
+      tutarFifo: Number((p.amountFifo ?? p.amount) || 0),
+      not: String(p.note || ""),
+      createdBy: String(p.createdBy || ""),
+      createdAt: p.createdAt || p.date || "",
+      dagitim: String(p.dagitim || "[]"),
+      dagitimadet: String(p.ozet || ""),
+      deletedAt,
+      isActive,
+    };
+  });
+
+  const settingsRows = [
+    { Anahtar: "priceDamacana", Değer: Number(settings?.priceDamacana || 0) },
+    { Anahtar: "pricePet05", Değer: Number(settings?.pricePet05 || 0) },
+    { Anahtar: "whatsapp", Değer: String(settings?.whatsapp || "") },
+    { Anahtar: "firmaAdi", Değer: String(settings?.firmaAdi || "") },
+  ];
+  const orderRows = buildOrderReportRows();
+  const paymentRows = buildPaymentReportRows();
+  const summaryRows = buildSummaryRowsForOrders(getVisibleOrdersSorted());
+
+  const wsSettingsRaw = window.XLSX.utils.json_to_sheet(rawSettingsRows);
+  const wsUsersRaw = window.XLSX.utils.json_to_sheet(rawUsersRows.length ? rawUsersRows : [{ Bilgi: "Kullanıcı yok" }]);
+  const wsOrdersRaw = window.XLSX.utils.json_to_sheet(rawOrderRows.length ? rawOrderRows : [{ Bilgi: "Sipariş yok" }]);
+  const wsPaymentsRaw = window.XLSX.utils.json_to_sheet(rawPaymentRows.length ? rawPaymentRows : [{ Bilgi: "Ödeme yok" }]);
+  const wsSummary = window.XLSX.utils.json_to_sheet(summaryRows);
+  const wsSettings = window.XLSX.utils.json_to_sheet(settingsRows);
+  const wsOrders = window.XLSX.utils.json_to_sheet(orderRows);
+  const wsPayments = window.XLSX.utils.json_to_sheet(paymentRows);
+
+  autoFitWorksheetColumns(wsSettingsRaw, rawSettingsRows);
+  autoFitWorksheetColumns(wsUsersRaw, rawUsersRows.length ? rawUsersRows : [{ Bilgi: "Kullanıcı yok" }]);
+  autoFitWorksheetColumns(wsOrdersRaw, rawOrderRows.length ? rawOrderRows : [{ Bilgi: "Sipariş yok" }]);
+  autoFitWorksheetColumns(wsPaymentsRaw, rawPaymentRows.length ? rawPaymentRows : [{ Bilgi: "Ödeme yok" }]);
+  autoFitWorksheetColumns(wsSummary, summaryRows);
+  autoFitWorksheetColumns(wsSettings, settingsRows);
+  autoFitWorksheetColumns(wsOrders, orderRows);
+  autoFitWorksheetColumns(wsPayments, paymentRows);
+
+  window.XLSX.utils.book_append_sheet(workbook, wsUsersRaw, "users");
+  window.XLSX.utils.book_append_sheet(workbook, wsOrdersRaw, "orders");
+  window.XLSX.utils.book_append_sheet(workbook, wsPaymentsRaw, "kismiOdemeler");
+  window.XLSX.utils.book_append_sheet(workbook, wsSettingsRaw, "settings");
+  window.XLSX.utils.book_append_sheet(workbook, wsSummary, "Ozet");
+  window.XLSX.utils.book_append_sheet(workbook, wsSettings, "Ayarlar");
+  window.XLSX.utils.book_append_sheet(workbook, wsOrders, "Siparisler");
+  window.XLSX.utils.book_append_sheet(workbook, wsPayments, "Odemeler");
+
+  saveWorkbook(workbook, `su_siparis_tum_veriler_${isoToYMD(new Date())}.xlsx`);
+  showToast?.("Excel dışa aktarıldı ✅", "success");
+}
+
+function exportExcelOrders(filterName) {
+  if (!ensureXlsxReady()) return;
+
+  let filterFn = null;
+  let title = "Tum Siparisler";
+  let filename = `su_siparis_tum_siparisler_${isoToYMD(new Date())}.xlsx`;
+
+  if (filterName === "debt") {
+    filterFn = (o) => Math.max(0, Number(o.qty || 0) - Number(o.paidQty || 0)) > 0;
+    title = "Borcu Kalan Siparisler";
+    filename = `su_siparis_borcu_kalanlar_${isoToYMD(new Date())}.xlsx`;
+  }
+
+  const rows = buildOrderReportRows(filterFn);
+  const workbook = window.XLSX.utils.book_new();
+  const ws = window.XLSX.utils.json_to_sheet(rows.length ? rows : [{ Bilgi: "Kayıt bulunamadı" }]);
+  autoFitWorksheetColumns(ws, rows.length ? rows : [{ Bilgi: "Kayıt bulunamadı" }]);
+  window.XLSX.utils.book_append_sheet(workbook, ws, title);
+  saveWorkbook(workbook, filename);
+  showToast?.("Excel raporu indirildi ✅", "success");
+}
+
+function exportExcelPayments() {
+  if (!ensureXlsxReady()) return;
+  const rows = buildPaymentReportRows();
+  const workbook = window.XLSX.utils.book_new();
+  const ws = window.XLSX.utils.json_to_sheet(rows.length ? rows : [{ Bilgi: "Kayıt bulunamadı" }]);
+  autoFitWorksheetColumns(ws, rows.length ? rows : [{ Bilgi: "Kayıt bulunamadı" }]);
+  window.XLSX.utils.book_append_sheet(workbook, ws, "Odemeler");
+  saveWorkbook(workbook, `su_siparis_odemeler_${isoToYMD(new Date())}.xlsx`);
+  showToast?.("Ödeme Excel raporu indirildi ✅", "success");
+}
+
+
+function parseWorkbookSettings(sheetRows) {
+  const rows = Array.isArray(sheetRows) ? sheetRows.filter(Boolean) : [];
+  if (!rows.length) return { ...defaultSettings };
+
+  const fromKeyValue = rows.some((row) => row?.Anahtar || row?.KEY || row?.Key);
+  if (fromKeyValue) {
+    const out = { ...defaultSettings };
+    rows.forEach((row) => {
+      const key = String(row?.Anahtar || row?.KEY || row?.Key || "").trim();
+      const value = row?.Değer ?? row?.VALUE ?? row?.Value ?? "";
+      if (key === "priceDamacana") out.priceDamacana = Number(value || 0);
+      if (key === "pricePet05") out.pricePet05 = Number(value || 0);
+      if (key === "whatsapp") out.whatsapp = String(value || "90");
+      if (key === "firmaAdi") out.firmaAdi = String(value || "");
+    });
+    return out;
+  }
+
+  const lastRow = rows.slice().reverse().find((row) => row && Object.values(row).some((v) => v !== null && v !== "")) || {};
+  return {
+    priceDamacana: Number(lastRow["D-BirimFiyat"] ?? lastRow.priceDamacana ?? lastRow.dBirimFiyat ?? 0),
+    pricePet05: Number(lastRow["P-BirimFiyat"] ?? lastRow.pricePet05 ?? lastRow.pBirimFiyat ?? 0),
+    firmaAdi: String(lastRow["FirmaAdı"] ?? lastRow.firmaAdi ?? ""),
+    whatsapp: String(lastRow["FirmaWhatsappNO"] ?? lastRow.whatsapp ?? "90"),
+  };
+}
+
+function parseWorkbookUsers(sheetRows) {
+  return (sheetRows || [])
+    .filter((row) => row && (row.username || row["username "] || row.Username || row.kullaniciAdi))
+    .map((row, idx) => ({
+      id: Number(row.id || idx + 1),
+      username: String(row.username || row["username "] || row.Username || row.kullaniciAdi || "").trim(),
+      pass: String(row.pass ?? row.password ?? row["password "] ?? row.sifre ?? ""),
+      role: String(row.role || row["role "] || "user"),
+      status: String(row.status || row["status "] || "active"),
+      createdAt: row.createdAt || new Date().toISOString(),
+    }))
+    .filter((u) => u.username);
+}
+
+function parseWorkbookOrders(sheetRows) {
+  return (sheetRows || [])
+    .filter((row) => row && (row.ID || row.id || row.Ürün || row.product || row.urun))
+    .map((row, idx) => {
+      const qty = Number(row.Adet ?? row.qty ?? row.adet ?? 0);
+      const paidQty = Number(row.ÖdenenAdet ?? row.paidQty ?? row.odenenAdet ?? 0);
+      const unitPrice = Number(row.BirimFiyat ?? row.unitPrice ?? row.birimFiyat ?? 0);
+      const total = Number(row.Tutar ?? row.total ?? row.tutar ?? qty * unitPrice);
+      const rawDate = row.Tarih ?? row.date ?? row.tarih ?? "";
+      const date = typeof rawDate === "number"
+        ? new Date(Math.round((rawDate - 25569) * 86400 * 1000)).toISOString()
+        : /\d{4}-\d{2}-\d{2}/.test(String(rawDate || ""))
+          ? ymdToIso(String(rawDate).slice(0, 10))
+          : new Date(rawDate || Date.now()).toISOString();
+
+      const isActive = row.isActive !== false && row.isActive !== "false";
+      const deletedAt = normalizeSoftDeleteTimestamp(
+        row.deletedAt || (!isActive ? row.updatedAt || row.createdAt || row.CreatedAt || date || Date.now() : ""),
+      );
+      return {
+        id: Number(row.ID || row.id || `imp_order_${Date.now()}_${idx}`),
+        product: normalizeProductFromLabel(row.Ürün ?? row.product ?? row.urun),
+        qty,
+        paidQty,
+        unitPrice,
+        total,
+        date,
+        note: String(row.Not || row.note || row.not || ""),
+        createdBy: String(row.createdBy || row.CreatedBy || ""),
+        createdAt: row.createdAt || row.CreatedAt || date,
+        updatedAt: row.updatedAt || row.UpdatedAt || row.createdAt || row.CreatedAt || "",
+        deletedAt,
+        isActive,
+      };
+    })
+    .filter((o) => o.id && o.qty >= 0);
+}
+
+function parseWorkbookPayments(sheetRows) {
+  return (sheetRows || [])
+    .filter((row) => row && (row.ID || row.id || row.Tutar || row.amount || row.tutarGirilen))
+    .map((row, idx) => {
+      const rawDate = row.Tarih ?? row.date ?? row.tarih ?? "";
+      const date = typeof rawDate === "number"
+        ? new Date(Math.round((rawDate - 25569) * 86400 * 1000)).toISOString()
+        : /\d{4}-\d{2}-\d{2}/.test(String(rawDate || ""))
+          ? ymdToIso(String(rawDate).slice(0, 10))
+          : new Date(rawDate || Date.now()).toISOString();
+
+      const isActive = row.isActive !== false && row.isActive !== "false";
+      const deletedAt = normalizeSoftDeleteTimestamp(
+        row.deletedAt || (!isActive ? row.updatedAt || row.createdAt || row.CreatedAt || date || Date.now() : ""),
+      );
+      return {
+        id: Number(row.ID || row.id || `imp_payment_${Date.now()}_${idx}`),
+        orderId: String(row.SiparişID || row.orderId || row.siparisId || ""),
+        qty: Number(row.Adet ?? row.qty ?? row.adet ?? 0),
+        amount: Number(row.Tutar ?? row.amount ?? row.tutarGirilen ?? 0),
+        amountFifo: Number(row.tutarFifo ?? row.amountFifo ?? row.TutarFifo ?? row.Tutar ?? row.amount ?? row.tutarGirilen ?? 0),
+        date,
+        firma: String(row.Firma || row.firma || settings?.firmaAdi || ""),
+        note: String(row.Not || row.note || row.not || ""),
+        createdBy: String(row.createdBy || row.CreatedBy || ""),
+        createdAt: row.createdAt || row.CreatedAt || date,
+        updatedAt: row.updatedAt || row.UpdatedAt || row.createdAt || row.CreatedAt || "",
+        dagitim: String(row.dagitim || row.Dagitim || "[]"),
+        ozet: String(row.ozet || row.dagitimadet || row.dagitimAdet || ""),
+        deletedAt,
+        isActive,
+      };
+    })
+    .filter((p) => p.id);
+}
+
+function mergeById(existingList, incomingList) {
+  const map = new Map();
+  (Array.isArray(existingList) ? existingList : []).forEach((item) => {
+    const key = String(item?.id || "");
+    if (key) map.set(key, { ...item });
+  });
+  (Array.isArray(incomingList) ? incomingList : []).forEach((item) => {
+    const key = String(item?.id || "");
+    if (!key) return;
+    map.set(key, { ...(map.get(key) || {}), ...item });
+  });
+  return Array.from(map.values());
+}
+
+async function pushImportedDataToFirebase(payload) {
+  await ensureFirebaseBootstrap();
+
+  const importedSettings = payload?.settings || {};
+  if (Object.keys(importedSettings).length) {
+    await gsPost({
+      action: "setSettings",
+      priceDamacana: Number(importedSettings.priceDamacana || 0),
+      pricePet05: Number(importedSettings.pricePet05 || 0),
+      firmaAdi: String(importedSettings.firmaAdi || ""),
+      whatsapp: String(importedSettings.whatsapp || ""),
+      actor: String(currentUser?.username || "excel-import"),
+    });
+  }
+
+  if (Array.isArray(payload?.users) && payload.users.length) {
+    await gsPost({ action: "setUsers", users: payload.users });
+  }
+
+  const orderUpdates = {};
+  (payload?.orders || []).forEach((o) => {
+    if (!o?.id) return;
+    orderUpdates[String(o.id)] = {
+      id: Number(o.id),
+      product: String(o.product || "damacana"),
+      qty: Number(o.qty || 0),
+      paidQty: Number(o.paidQty || 0),
+      unitPrice: Number(o.unitPrice || 0),
+      total: Number(o.total || Number(o.qty || 0) * Number(o.unitPrice || 0)),
+      date: String(o.date || new Date().toISOString()),
+      note: String(o.note || ""),
+      createdBy: String(o.createdBy || currentUser?.username || ""),
+      createdAt: o.createdAt || new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      deletedAt: orderDeletedStamp(o),
+      isActive: o.isActive !== false && !orderDeletedStamp(o),
+    };
+  });
+  if (Object.keys(orderUpdates).length) {
+    await fbRef("orders").update(orderUpdates);
+  }
+
+  const paymentUpdates = {};
+  (payload?.payments || []).forEach((p) => {
+    if (!p?.id) return;
+    paymentUpdates[String(p.id)] = {
+      id: Number(p.id),
+      date: String(p.date || new Date().toISOString()),
+      firma: String(p.firma || ""),
+      qty: Number(p.qty || 0),
+      amount: Number(p.amount || 0),
+      amountFifo: Number((p.amountFifo ?? p.amount) || 0),
+      note: String(p.note || ""),
+      createdBy: String(p.createdBy || currentUser?.username || ""),
+      createdAt: p.createdAt || new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      dagitim: String(p.dagitim || "[]"),
+      ozet: String(p.ozet || ""),
+      deletedAt: paymentDeletedStamp(p),
+      isActive: p.isActive !== false && !paymentDeletedStamp(p),
+    };
+  });
+  if (Object.keys(paymentUpdates).length) {
+    await fbRef("payments").update(paymentUpdates);
+  }
+}
+
+async function applyImportedWorkbookData(payload) {
+  const nextSettings =
+    payload?.settings && Object.keys(payload.settings || {}).length
+      ? { ...settings, ...payload.settings }
+      : { ...settings };
+
+  const mergedUsers = mergeById(loadUsers(), payload?.users || []);
+  const mergedOrders = mergeById(loadOrders(), payload?.orders || []);
+  const mergedPayments = mergeById(loadPayments(), payload?.payments || []);
+
+  saveSettings(nextSettings);
+  saveUsers(mergedUsers);
+  saveOrders(mergedOrders);
+  savePayments(mergedPayments);
+
+  settings = loadSettings();
+  orders = loadOrders();
+  payments = loadPayments();
+
+  if (typeof recomputePaidFromPayments === "function") recomputePaidFromPayments();
+
+  await pushImportedDataToFirebase({
+    settings: nextSettings,
+    users: mergedUsers,
+    orders: orders,
+    payments: payments,
+  });
+
+  await Promise.allSettled([
+    syncUsersFromSheet?.({ silent: true }),
+    syncOrdersFromSheet?.({ silent: true }),
+    syncPaymentsFromSheet?.({ silent: true }),
+    syncSettingsFromSheet?.({ silent: true }),
+  ]);
+
+  renderSettings?.();
+  renderOrders?.();
+  renderSummary?.();
+  renderDebtTable?.();
+  renderPayHistory?.();
+  renderUsersTable?.();
+  renderPassiveUsers?.();
+  perfInvalidate("xlsx import");
+}
+
+function normalizeSheetName(name) {
+  return String(name || "")
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[̀-ͯ]/g, "")
+    .replace(/ı/g, "i")
+    .replace(/ş/g, "s")
+    .replace(/ğ/g, "g")
+    .replace(/ç/g, "c")
+    .replace(/ö/g, "o")
+    .replace(/ü/g, "u")
+    .replace(/[^a-z0-9]/g, "");
+}
+
+function findWorkbookSheet(wb, aliases) {
+  const names = Array.isArray(wb?.SheetNames) ? wb.SheetNames : [];
+  const normalizedAliases = (aliases || []).map(normalizeSheetName);
+  const foundName = names.find((name) => normalizedAliases.includes(normalizeSheetName(name)));
+  return foundName ? wb.Sheets[foundName] : null;
+}
+
+async function importExcelFromFile(file) {
+  if (!ensureXlsxReady()) throw new Error("Excel modülü yüklenemedi");
+  const buffer = await file.arrayBuffer();
+  const wb = window.XLSX.read(buffer, { type: "array" });
+
+  const settingsSheet = findWorkbookSheet(wb, ["Ayarlar", "settings"]);
+  const usersSheet = findWorkbookSheet(wb, ["users", "Kullanicilar"]);
+  const ordersSheet = findWorkbookSheet(wb, [
+    "Siparisler",
+    "orders",
+    "Tum Siparisler",
+    "Borcu Kalan Siparisler",
+    "TumSiparisler",
+    "BorcuKalanSiparisler",
+  ]);
+  const paymentsSheet = findWorkbookSheet(wb, ["Odemeler", "kismiOdemeler", "payments"]);
+
+  const settingsRows = window.XLSX.utils.sheet_to_json(settingsSheet || {});
+  const usersRows = window.XLSX.utils.sheet_to_json(usersSheet || {});
+  const orderRows = window.XLSX.utils.sheet_to_json(ordersSheet || {});
+  const paymentRows = window.XLSX.utils.sheet_to_json(paymentsSheet || {});
+
+  if (!settingsRows.length && !usersRows.length && !orderRows.length && !paymentRows.length) {
+    throw new Error("Excel içinde okunabilir sayfa bulunamadı.");
+  }
+
+  const payload = {
+    settings: settingsRows.length ? parseWorkbookSettings(settingsRows) : null,
+    users: usersRows.length ? parseWorkbookUsers(usersRows) : [],
+    orders: orderRows.length ? parseWorkbookOrders(orderRows) : [],
+    payments: paymentRows.length ? parseWorkbookPayments(paymentRows) : [],
+  };
+
+  if (!payload.users.length && !payload.orders.length && !payload.payments.length && !payload.settings) {
+    throw new Error("Excel bulundu ama içindeki satırlar uygulamaya uygun okunamadı.");
+  }
+
+  await applyImportedWorkbookData(payload);
+}
+document.getElementById("btnExcelExportAll")?.addEventListener("click", () => {
+  document.getElementById("menuExcel")?.classList.remove("open");
+  exportExcelAllData();
+});
+
+document.getElementById("btnExcelExportDebt")?.addEventListener("click", () => {
+  document.getElementById("menuExcel")?.classList.remove("open");
+  exportExcelOrders("debt");
+});
+
+document.getElementById("btnExcelExportPayments")?.addEventListener("click", () => {
+  document.getElementById("menuExcel")?.classList.remove("open");
+  exportExcelPayments();
+});
+
+document.getElementById("btnExcelImport")?.addEventListener("click", () => {
+  document.getElementById("menuExcel")?.classList.remove("open");
+  document.getElementById("backupFileExcel")?.click();
+});
+
+document.getElementById("backupFileExcel")?.addEventListener("change", async (e) => {
+  const file = e.target.files?.[0];
+  if (!file) return;
+  try {
+    await importExcelFromFile(file);
+    uiOpen?.({
+      title: "Excel yüklendi ✅",
+      subtitle: "Veriler içe aktarıldı",
+      body: `Dosya: ${file.name}` ,
+      okText: "Tamam",
+      showCancel: false,
+    });
+    showToast?.("Excel içe aktarıldı ✅", "success");
+  } catch (err) {
+    uiOpen?.({
+      title: "Excel yüklenemedi ❌",
+      subtitle: "Dosya yapısı uygun değil",
+      body: String(err),
+      okText: "Tamam",
+      showCancel: false,
+    });
+    showToast?.("Excel yüklenemedi ❌", "error");
+  } finally {
+    e.target.value = "";
+  }
+});
+
+function loadPayments() {
+  try {
+    const raw = localStorage.getItem(PAYMENTS_KEY);
+    return raw ? JSON.parse(raw) : [];
+  } catch {
+    return [];
+  }
+}
+
+function savePayments(list) {
+  localStorage.setItem(PAYMENTS_KEY, JSON.stringify(Array.isArray(list) ? list : []));
+  perfInvalidate("payments changed");
+}
+
+/* ================== PERF CACHE (Özet + Raporlar) ================== */
+/*
+              Amaç:
+              - renderSummary / raporlar her seferinde orders üzerinde filter+reduce yapmasın
+              - orders değişince cache sıfırlansın, ihtiyaç olunca 1 kere hesaplanıp saklansın
+            */
+
+const perfCache = {
+  // dashYear -> { toplamAdet, toplamSiparisTutari, odenenTutar, kalan, paidQtyAll }
+  summaryByDashYear: new Map(),
+
+  // rptYear -> months[12] = { qty,total,paid }
+  yearStats: new Map(),
+
+  dirty: true,
+};
+
+function perfInvalidate(reason) {
+  perfCache.dirty = true;
+  perfCache.summaryByDashYear.clear();
+  perfCache.yearStats.clear();
+  // istersen debug:
+  // console.log("perfInvalidate:", reason);
+}
+
+function perfKeyDashYear() {
+  return dashYear == null ? "ALL" : String(dashYear);
+}
+
+function perfGetVisibleOrders() {
+  // tek yerden "silinmeyen siparişler"
+  return (orders || []).filter((o) => !orderDeletedStamp(o));
+}
+
+// summary hesapla (dashboard yılına göre)
+function perfComputeSummaryForDashYear() {
+  const key = perfKeyDashYear();
+
+  // cache temizse direkt dön
+  if (!perfCache.dirty && perfCache.summaryByDashYear.has(key)) {
+    return perfCache.summaryByDashYear.get(key);
+  }
+
+  const visible = perfGetVisibleOrders();
+  const list = filterByDashYear(visible);
+
+  const toplamAdet =
+    Number(list.reduce((s, o) => s + Number(o.qty || 0), 0)) || 0;
+
+  const toplamSiparisTutari =
+    Number(
+      list.reduce((s, o) => {
+        const qty = Number(o.qty || 0);
+        const unit = Number(o.unitPrice || 0);
+        return s + qty * unit;
+      }, 0),
+    ) || 0;
+
+  const odenenTutar =
+    Number(
+      list.reduce((s, o) => {
+        const qty = Number(o.qty || 0);
+        const unit = Number(o.unitPrice || 0);
+        const paidQty = Math.min(qty, Number(o.paidQty || 0));
+        return s + paidQty * unit;
+      }, 0),
+    ) || 0;
+
+  const kalan = Math.max(0, toplamSiparisTutari - odenenTutar);
+
+  const paidQtyAll =
+    Number(list.reduce((s, o) => s + Number(o.paidQty || 0), 0)) || 0;
+
+  const out = {
+    toplamAdet,
+    toplamSiparisTutari,
+    odenenTutar,
+    kalan,
+    paidQtyAll,
+  };
+
+  perfCache.summaryByDashYear.set(key, out);
+  perfCache.dirty = false;
+
+  return out;
+}
+
+/* Raporlar için yıllık ay istatistikleri: months[12] = {qty,total,paid}
+               Not: burada da "silinmeyen siparişler" üzerinden hesaplıyoruz. */
+function perfComputeYearStats(year) {
+  if (!perfCache.dirty && perfCache.yearStats.has(year)) {
+    return perfCache.yearStats.get(year);
+  }
+
+  const months = Array.from({ length: 12 }, () => ({
+    qty: 0,
+    total: 0,
+    paid: 0,
+  }));
+  const visible = perfGetVisibleOrders();
+
+  for (const o of visible) {
+    const d = new Date(o.date || "");
+    if (isNaN(d)) continue;
+    if (d.getFullYear() !== year) continue;
+
+    const m = d.getMonth(); // 0-11
+    const qty = Number(o.qty || 0);
+    const unit = Number(o.unitPrice || 0);
+    const paidQty = Math.min(qty, Number(o.paidQty || 0));
+
+    months[m].qty += qty;
+    months[m].total += qty * unit;
+    months[m].paid += paidQty * unit;
+  }
+
+  perfCache.yearStats.set(year, months);
+  perfCache.dirty = false;
+  return months;
+}
+
+let payments = [];
+let editingPaymentId = null;
+let rptMonthDetailOpen = false;
+let dashYear = new Date().getFullYear(); // başlangıç
+
+function renderDashYearLabel(shouldFocus = false) {
+  const el = document.getElementById("dashYearText");
+  if (!el) return;
+
+  const nowYear = new Date().getFullYear();
+
+  // yazı
+  el.textContent = dashYear == null ? "Tümü" : String(dashYear);
+
+  // class reset
+  el.classList.remove("is-selected", "is-current", "is-all");
+
+  // her durumda seçili görünsün
+  el.classList.add("is-selected");
+
+  if (dashYear == null) {
+    el.classList.add("is-all");
+  } else if (dashYear === nowYear) {
+    el.classList.add("is-current");
+  }
+
+  // istenirse focus (ilk açılış + yıl değişince)
+  if (shouldFocus) {
+    el.focus({ preventScroll: true });
+  }
+}
+
+document.getElementById("btnDashYearPrev")?.addEventListener("click", () => {
+  if (dashYear == null) dashYear = new Date().getFullYear();
+  dashYear--;
+  renderDashYearLabel(true);
+
+  renderDashboard(); // sende dashboard güncelleyen fonksiyon adı neyse o
+});
+
+document.getElementById("btnDashYearNext")?.addEventListener("click", () => {
+  if (dashYear == null) dashYear = new Date().getFullYear();
+  dashYear++;
+  renderDashYearLabel(true);
+
+  renderDashboard();
+});
+
+document.getElementById("btnDashYearAll")?.addEventListener("click", () => {
+  dashYear = null;
+  renderDashYearLabel(true);
+
+  renderDashboard();
+});
+function renderDashboard() {
+  // Dashboard = özet + pil + sağ kutular
+  renderSummary();
+
+  // Borç modalı açıksa listeyi de yenileyelim
+  const debtModal = document.getElementById("debtModal");
+  if (debtModal && !debtModal.classList.contains("hidden")) {
+    if (typeof renderDebtTable === "function") renderDebtTable();
+  }
+}
+
+function getYearFromDateStr(s) {
+  // s: "2026-01-19" veya "19.01.2026" olabilir
+  if (!s) return null;
+  if (s.includes("-")) return Number(s.slice(0, 4));
+  const parts = s.split(".");
+  if (parts.length === 3) return Number(parts[2]);
+  return null;
+}
+
+function filterByDashYear(arr) {
+  if (dashYear == null) return arr; // tümü
+  return arr.filter((x) => getYearFromDateStr(x.date || x.tarih) === dashYear);
+}
+
+function fifoCostForQty(qtyWanted) {
+  const list = getDebtItems(); // en eski üstte
+  let remaining = Math.max(0, Number(qtyWanted || 0));
+  let cost = 0;
+
+  for (const o of list) {
+    if (remaining <= 0) break;
+    const take = Math.min(remaining, Number(o.remainingQty || 0));
+    cost += take * Number(o.unitPrice || 0);
+    remaining -= take;
+  }
+  return Number(cost || 0);
+}
+
+function fifoQtyForAmount(amount) {
+  const list = getDebtItems();
+  let money = Math.max(0, Number(amount || 0));
+  let qty = 0;
+
+  for (const o of list) {
+    if (money <= 0) break;
+    const unit = Number(o.unitPrice || 0);
+    const canLeft = Number(o.remainingQty || 0);
+    if (unit <= 0) continue;
+
+    // bu siparişten alınabilecek adet
+    const maxAffordable = Math.floor(money / unit);
+    const take = Math.min(canLeft, maxAffordable);
+
+    if (take > 0) {
+      qty += take;
+      money -= take * unit;
+    }
+  }
+  return Number(qty || 0);
+}
+function getCurrentDebtTotals() {
+  const list = getDebtItems();
+  const totalQty = list.reduce((s, x) => s + Number(x.remainingQty || 0), 0);
+  const totalTl = list.reduce((s, x) => s + Number(x.remainingTotal || 0), 0);
+  return { totalQty, totalTl };
+}
+
+function getDebtAfterPay(qtyPay) {
+  const now = getCurrentDebtTotals();
+  const payQty = Math.max(0, Number(qtyPay || 0));
+  const payTl = fifoCostForQty(payQty);
+  return {
+    afterQty: Math.max(0, now.totalQty - payQty),
+    afterTl: Math.max(0, now.totalTl - payTl),
+    payTl,
+  };
+}
+
+function renderPayAfterInfo(qtyPay) {
+  const el = document.getElementById("payAfterInfo");
+  if (!el) return;
+
+  const now = getCurrentDebtTotals();
+  if (!qtyPay || qtyPay < 1) {
+    el.textContent = `Mevcut kalan borç: ${now.totalQty} adet • ${now.totalTl.toFixed(2)} ₺`;
+    return;
+  }
+
+  const r = getDebtAfterPay(qtyPay);
+  el.textContent = `Bu ödeme (${qtyPay} adet • ${r.payTl.toFixed(2)} ₺) sonrası kalan: ${r.afterQty} adet • ${r.afterTl.toFixed(2)} ₺`;
+}
+
+// ===== Google Sheets (Apps Script) =====
+const GS_URL =
+  "https://script.google.com/macros/s/AKfycby7aNR9Ef7TtuaYvBIYrkrRYFQUf1vR06JCiv3okMHMNKxjSxXA2te-Sq3Ksd_UdTYLFg/exec";
+
+async function gsPost(payload) {
+  // ✅ CORS preflight yok: GET ile gönderiyoruz
+  const q = encodeURIComponent(JSON.stringify(payload));
+  const url = `${GS_URL}?q=${q}&_=${Date.now()}`; // ✅ cache kır
+
+  const res = await fetch(url, { method: "GET", cache: "no-store" });
+
+  const txt = await res.text();
+
+  // Bazı durumlarda Apps Script HTML dönerse burada yakalarız
+  try {
+    return JSON.parse(txt);
+  } catch (e) {
+    console.warn("GS RAW:", txt);
+    throw new Error("Firebase yanıtı okunamadı");
+  }
+}
+
+async function setSettingsOnSheet(s) {
+  const payload = {
+    action: "setSettings",
+    priceDamacana: Number(s.priceDamacana || 0),
+    pricePet05: Number(s.pricePet05 || 0),
+    firmaAdi: String(s.firmaAdi || "").trim(),
+    whatsapp: String(s.whatsapp || "").trim(),
+    actor: currentUser?.username || "",
+  };
+
+  const res = await gsPost(payload);
+  if (!res?.ok) throw new Error(res?.message || "setSettings başarısız");
+  showToast("Ayarlar Firebase'e kaydedildi ✅", "success");
+  return true;
+}
+
+async function syncSettingsFromSheet() {
+  try {
+    const res = await gsPost({ action: "getSettings" });
+    if (!res?.ok) throw new Error(res?.message || "getSettings başarısız");
+
+    // gelen 4 ayarı normalize et
+    const s = {
+      priceDamacana: Number(res.data?.priceDamacana || 0),
+      pricePet05: Number(res.data?.pricePet05 || 0),
+      firmaAdi: String(res.data?.firmaAdi || "").trim(),
+      whatsapp: String(res.data?.whatsapp || "").trim(),
+    };
+
+    // Uygulama ayarlarını güncelle
+    settings = s;
+    saveSettings(settings); // offline için localde kalsın (kullanıcı verisi değil, ortak config)
+
+    // Eğer admin Ayarlar sayfasını açtıysa inputlara bas
+    document.getElementById("inpPriceDamacana") &&
+      (document.getElementById("inpPriceDamacana").value =
+        s.priceDamacana || "");
+    document.getElementById("inpPricePet05") &&
+      (document.getElementById("inpPricePet05").value = s.pricePet05 || "");
+    document.getElementById("inpFirmaAdi") &&
+      (document.getElementById("inpFirmaAdi").value = s.firmaAdi || "");
+    document.getElementById("inpWhatsapp") &&
+      (document.getElementById("inpWhatsapp").value = s.whatsapp || "");
+
+    // UI’ları güncelle (dashboard vb.)
+    renderSummary?.();
+    renderOrders?.();
+    return true;
+  } catch (e) {
+    console.warn("syncSettingsFromSheet:", e);
+    return false;
+  }
+}
+
+// ===== USERS -> Google Sheets =====
+async function addUserToSheet(u) {
+  try {
+    const res = await gsPost({
+      action: "addUser",
+      username: String(u.username || ""),
+      password: String(u.pass || ""), // sheet başlığın "password" ise bu doğru
+      role: String(u.role || "user"),
+      status: String(u.status || "pending"),
+      createdAt: Number(u.createdAt || Date.now()),
+    });
+
+    if (!res?.ok) throw new Error(res?.message || "addUser başarısız");
+    return true;
+  } catch (e) {
+    console.warn("addUserToSheet hata:", e);
+    showToast?.("Kullanıcı Firebase'e yazılamadı", "error");
+    return false;
+  }
+}
+
+function normalizeGsOrderToLocal(row) {
+  // Sheet'ten gelen "orders" satırını bizim local order formatına çevir
+  const product = String(row.urun || "")
+    .toUpperCase()
+    .includes("DAMACANA")
+    ? "damacana"
+    : "pet05";
+  const isActive = row.isActive !== false && row.isActive !== "false";
+  const deletedAt = normalizeSoftDeleteTimestamp(
+    row.deletedAt || (!isActive ? row.updatedAt || row.createdAt || row.tarih || Date.now() : ""),
+  );
+  return {
+    id: Number(row.id || Date.now()),
+    product,
+    qty: Number(row.adet || 0),
+    paidQty: Number(row.odenenAdet || 0),
+    unitPrice: Number(row.birimFiyat || 0),
+    total: Number(row.tutar || 0),
+    date: String(row.tarih || "")
+      ? String(row.tarih).includes("T")
+        ? String(row.tarih)
+        : String(row.tarih) + "T00:00:00.000Z"
+      : new Date().toISOString(),
+    createdBy: row.createdBy || "",
+    createdAt: row.createdAt || "",
+    updatedAt: row.updatedAt || "",
+    deletedAt,
+    isActive: !deletedAt && isActive,
+  };
+}
+
+async function syncOrdersFromSheet(opts = {}) {
+  const silent = !!opts.silent;
+  try {
+    const list = await gsPost({ action: "getOrders" });
+    if (!Array.isArray(list))
+      throw new Error("Firebase'den sipariş listesi gelmedi");
+
+    orders = list.map(normalizeGsOrderToLocal).filter((o) => o.id);
+    saveOrders(orders);
+    refreshPaidStateFromPaymentsOnly?.();
+    setOrdersLastSync?.(new Date());
+
+    if (!silent) {
+      renderOrders?.();
+      applyPermissions?.();
+      renderSummary?.();
+      if (typeof renderDebtTable === "function") renderDebtTable();
+      showToast?.("Firebase ile eşitlendi", "success");
+    }
+
+    return orders;
+  } catch (e) {
+    console.warn(e);
+    if (!silent) {
+      showToast?.("Firebase ile eşitlenemedi (offline olabilir)", "error");
+    }
+    return orders;
+  }
+}
+
+function normalizeGsPaymentRowToLocal(row) {
+  const id = Number(row[0] || 0);
+  const isActive = row[11] === true || String(row[11]).toLowerCase() === "true";
+  const deletedAt = normalizeSoftDeleteTimestamp(
+    row[12] || (!isActive ? row[8] || row[1] || Date.now() : ""),
+  );
+  return {
+    id,
+    date: String(row[1] || ""),
+    firma: String(row[2] || ""),
+    qty: Number(row[3] || 0),
+    amount: Number(row[4] || 0),
+    amountFifo: Number(row[5] || row[4] || 0),
+    note: String(row[6] || ""),
+    createdBy: String(row[7] || ""),
+    createdAt: row[8] || "",
+    dagitim: String(row[9] || "[]"),
+    ozet: String(row[10] || ""),
+    deletedAt,
+    isActive: !deletedAt && isActive,
+  };
+}
+
+async function syncPaymentsFromSheet(opts = {}) {
+  const silent = !!opts.silent;
+
+  try {
+    const list = await gsPost({ action: "getPayments" });
+    if (!Array.isArray(list)) {
+      throw new Error("Firebase'den ödeme listesi gelmedi");
+    }
+
+    payments = list
+      .map(normalizeGsPaymentRowToLocal)
+      .filter((p) => p.id);
+
+    savePayments(payments);
+    perfInvalidate("payments changed");
+    recomputePaidFromPayments?.();
+    setPayLastSync?.(new Date());
+
+    if (!silent) {
+      renderPayHistory?.();
+      renderSummary?.();
+      if (typeof renderDebtTable === "function") renderDebtTable();
+    }
+
+    return payments;
+  } catch (e) {
+    console.warn(e);
+    if (!silent) {
+      showToast?.("Firebase'den ödemeler çekilemedi", "error");
+    }
+    return payments;
+  }
+}
+/* ================== GS-Users-Sync (Google tek kaynak) ================== */
+
+// ✅ RAM cache: loadUsers() hep burayı döndürecek (sync ile dolar)
+var __usersCache = [];
+
+// Kullanıcı satırını normalize et (Sheet objesi -> app objesi)
+function normalizeGsUserToLocal(u) {
+  return {
+    id: Number(u.id || Date.now()),
+    username: String(u.username || "").trim(),
+    pass: String(u.pass ?? u.password ?? u.sifre ?? ""),
+    role: String(u.role || "user"),
+    status: String(u.status || "pending"), // active | passive | pending
+    createdAt: u.createdAt || Date.now(),
+  };
+}
+
+// ✅ Google’dan kullanıcıları çek
+// ✅ Google’dan kullanıcıları çek
+async function syncUsersFromSheet({ silent = false } = {}) {
+  try {
+    const res = await gsPost({ action: "getUsers" });
+
+    // ✅ getUsers bazen array, bazen {ok,data/users} dönebilir
+    const list = Array.isArray(res)
+      ? res
+      : Array.isArray(res?.users)
+        ? res.users
+        : Array.isArray(res?.data)
+          ? res.data
+          : Array.isArray(res?.list)
+            ? res.list
+            : null;
+
+    if (!Array.isArray(list)) {
+      console.warn("getUsers raw:", res);
+      throw new Error("Sheets getUsers array dönmedi");
+    }
+
+    __usersCache = list.map(normalizeGsUserToLocal).filter((u) => u.username);
+
+    // UI yenilemeleri
+    if (typeof renderUsersTable === "function") renderUsersTable();
+    if (typeof renderPassiveUsers === "function") renderPassiveUsers();
+    applyPermissions?.();
+
+    if (!silent)
+      showToast?.("Kullanıcılar Firebase'den güncellendi ✅", "success");
+    return __usersCache;
+  } catch (e) {
+    console.warn("syncUsersFromSheet hata:", e);
+    if (!silent) showToast?.("Kullanıcılar Firebase'den çekilemedi", "error");
+    return __usersCache;
+  }
+}
+
+// ✅ Eski kodlar bozulmasın diye: loadUsers artık localStorage değil cache
+function loadUsers() {
+  return Array.isArray(__usersCache) ? __usersCache : [];
+}
+
+// ✅ saveUsers: localStorage yazma yok. Cache güncelle + Google’a tam liste bas (fire&forget)
+function saveUsers(list) {
+  __usersCache = Array.isArray(list) ? list : [];
+
+  // fire & forget: UI donmasın
+  gsPost({ action: "setUsers", users: __usersCache })
+    .then(() => showToast?.("Kullanıcılar Firebase'e yazıldı ✅", "success"))
+    .catch((e) => {
+      console.warn(e);
+      showToast?.("Kullanıcılar Firebase'e yazılamadı", "error");
+    });
+}
+
+// Tekil işlemler: status / pass
+async function setUserStatusOnSheet(username, status) {
+  return await gsPost({ action: "setUserStatus", username, status });
+}
+async function setUserPasswordOnSheet(username, pass) {
+  return await gsPost({ action: "setUserPassword", username, pass });
+}
+
+async function pushOrderToSheet(localOrder) {
+  // local -> sheet formatına çevirip gönder
+  const urunText = localOrder.product === "damacana" ? "DAMACANA" : "0,5L PET";
+  return await gsPost({
+    action: "addOrder",
+    id: Number(localOrder.id), // ✅ EKLENDİ: local id -> sheet id aynı olsun
+    tarih: String(localOrder.date || "").slice(0, 10),
+    urun: urunText,
+    adet: Number(localOrder.qty || 0),
+    birimFiyat: Number(localOrder.unitPrice || 0),
+    tutar: Number(localOrder.total || 0),
+    odenenAdet: Number(localOrder.paidQty || 0),
+    kalanAdet: Math.max(
+      0,
+      Number(localOrder.qty || 0) - Number(localOrder.paidQty || 0),
+    ),
+    durum:
+      Number(localOrder.paidQty || 0) >= Number(localOrder.qty || 0)
+        ? "TAMAMLANDI"
+        : "BEKLİYOR",
+    createdBy: currentUser?.username || "unknown",
+  });
+}
+// ✅ Google Sheets: Sipariş Güncelle (ID'ye göre satırı günceller)
+async function updateOrderOnSheet(localOrder) {
+  const urunText = localOrder.product === "damacana" ? "DAMACANA" : "0,5L PET";
+  return await gsPost({
+    action: "updateOrder",
+    id: Number(localOrder.id),
+    tarih: String(localOrder.date || "").slice(0, 10),
+    urun: urunText,
+    adet: Number(localOrder.qty || 0),
+    birimFiyat: Number(localOrder.unitPrice || 0),
+    tutar: Number(localOrder.total || 0),
+    odenenAdet: Number(localOrder.paidQty || 0),
+    kalanAdet: Math.max(
+      0,
+      Number(localOrder.qty || 0) - Number(localOrder.paidQty || 0),
+    ),
+    durum:
+      Number(localOrder.paidQty || 0) >= Number(localOrder.qty || 0)
+        ? "TAMAMLANDI"
+        : "BEKLİYOR",
+    updatedBy: currentUser?.username || "unknown",
+  });
+}
+
+async function archiveOrderOnSheet(id) {
+  try {
+    // sadece admin kullansın (UI zaten admin'e açık ama garanti olsun)
+    if (!isAdminActive()) return;
+
+    const res = await gsPost({
+      action: "archiveOrder",
+      id: Number(id),
+      actor: currentUser?.username || "",
+    });
+
+    if (res?.ok) {
+      showToast?.("Kayıt arşivlendi ✅", "success");
+    } else {
+      showToast?.("Arşivleme hatası: " + (res?.message || ""), "error");
+    }
+  } catch (e) {
+    console.warn(e);
+    showToast?.("Arşivleme başarısız", "error");
+  }
+}
+async function applyPaymentOnSheet(p) {
+  return await gsPost({
+    action: "applyPayment",
+    id: Number(p.id),
+    tarih: String(p.date || new Date().toISOString()),
+    firma: String(p.firma || ""),
+    adet: Number(p.qty || 0),
+    tutarGirilen: Number(p.amount || 0),
+    not: String(p.note || ""),
+    createdBy: currentUser?.username || "unknown",
+  });
+}
+
+async function restoreOrderOnSheet(id) {
+  try {
+    const res = await gsPost({
+      action: "restoreOrder",
+      id: Number(id),
+    });
+
+    if (!res?.ok) {
+      throw new Error(res?.message || "restoreOrder başarısız");
+    }
+    return true;
+  } catch (e) {
+    console.warn("Google restore hatası:", e);
+    if (typeof showToast === "function") {
+      showToast("Geri yükleme hatası", "danger");
+    }
+    return false;
+  }
+}
+// ===== PAYMENTS -> Google Sheets =====
+async function archivePaymentOnSheet(paymentId) {
+  return await gsPost({ action: "archivePayment", id: Number(paymentId) });
+}
+
+async function updatePaymentOnSheet(p) {
+  return await gsPost({
+    action: "updatePayment",
+    id: Number(p.id),
+    tarih: String(p.date || new Date().toISOString()),
+    firma: String(p.firma || ""),
+    adet: Number(p.qty || 0),
+    tutarGirilen: Number(p.amount || 0),
+    not: String(p.note || ""),
+    updatedBy: currentUser?.username || "unknown",
+  });
+}
+
+async function restorePaymentOnSheet(id) {
+  try {
+    const res = await gsPost({
+      action: "restorePayment",
+      id: Number(id),
+      actor: currentUser?.username || "",
+    });
+    if (!res?.ok) throw new Error(res?.message || "restorePayment başarısız");
+    return true;
+  } catch (e) {
+    console.warn("Google payment restore hatası:", e);
+    showToast?.("Ödeme geri yükleme başarısız", "error");
+    return false;
+  }
+}
+
+async function updatePaymentOnSheet(payload) {
+  try {
+    const res = await gsPost({
+      action: "updatePayment",
+      ...payload,
+      actor: currentUser?.username || "",
+    });
+    if (!res?.ok) throw new Error(res?.message || "updatePayment başarısız");
+    return res;
+  } catch (e) {
+    console.warn("Google payment update hatası:", e);
+    showToast?.("Ödeme güncelleme başarısız", "error");
+    return { ok: false, message: String(e) };
+  }
+}
+
+function loadOrders() {
+  try {
+    const raw = localStorage.getItem(ORDERS_KEY);
+    return raw ? JSON.parse(raw) : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveOrders(list) {
+  localStorage.setItem(ORDERS_KEY, JSON.stringify(list));
+  perfInvalidate("orders changed");
+}
+const PAGE_SIZE = 10; /*tablo kaç adet görünece*/
+let currentPage = 1;
+let orders = [];
+let editingOrderId = null;
+
+const defaultSettings = {
+  priceDamacana: 0,
+  pricePet05: 0,
+  whatsapp: "90",
+  firmaAdi: "",
+};
+
+function loadSettings() {
+  try {
+    const raw = localStorage.getItem(SETTINGS_KEY);
+    if (!raw) return { ...defaultSettings };
+    const obj = JSON.parse(raw);
+    return {
+      priceDamacana: Number(obj.priceDamacana || 0),
+      pricePet05: Number(obj.pricePet05 || 0),
+      whatsapp: String(obj.whatsapp || "90"),
+      firmaAdi: String(obj.firmaAdi || ""),
+    };
+  } catch {
+    return { ...defaultSettings };
+  }
+}
+
+function saveSettings(s) {
+  localStorage.setItem(SETTINGS_KEY, JSON.stringify(s));
+}
+
+let settings = { ...defaultSettings };
+
+function renderSettings() {
+  const a = document.getElementById("inpPriceDamacana");
+  const b = document.getElementById("inpPricePet05");
+  const w = document.getElementById("inpWhatsapp");
+  const f = document.getElementById("inpFirmaAdi");
+
+  if (a) a.value = settings.priceDamacana;
+  if (b) b.value = settings.pricePet05;
+  if (w) w.value = settings.whatsapp;
+  if (f) f.value = settings.firmaAdi || "ABDULLAH ÖZER";
+  updateBackupFileStatus().catch(console.warn);
+  updateLastBackupInfoUI();
+}
+
+function normalizeWhatsapp(raw) {
+  // sadece rakam bırak
+  const digits = String(raw || "").replace(/\D/g, "");
+  // boşsa default 90
+  if (!digits) return "90";
+  return digits;
+}
+
+document
+  .getElementById("btnSaveSettings")
+  ?.addEventListener("click", async () => {
+    settings = {
+      priceDamacana: Number(
+        document.getElementById("inpPriceDamacana")?.value || 0,
+      ),
+      pricePet05: Number(document.getElementById("inpPricePet05")?.value || 0),
+      whatsapp: normalizeWhatsapp(
+        document.getElementById("inpWhatsapp")?.value,
+      ),
+      firmaAdi: String(
+        document.getElementById("inpFirmaAdi")?.value || "ABDULLAH ÖZER",
+      ).trim(),
+    };
+
+    saveSettings(settings);
+
+    if (isAdminActive?.()) {
+      try {
+        await setSettingsOnSheet(settings); // ✅ TEK GÖNDERİM
+      } catch (e) {
+        console.warn(e);
+        showToast("Firebase'e yazılamadı ❌", "error");
+      }
+    }
+
+    showToast("Ayarlar kaydedildi ✅", "success");
+
+    const info = document.getElementById("settingsInfo");
+    if (info) {
+      info.textContent = "✅ Ayarlar kaydedildi.";
+      setTimeout(() => {
+        const el = document.getElementById("settingsInfo");
+        if (el) el.textContent = "";
+      }, 1500);
+    }
+  });
+
+
+/* ================== YENİ SİPARİŞ MODAL ================== */
+const modal = document.getElementById("orderModal");
+function setTodayToDateInput() {
+  const d = new Date();
+  const yyyy = d.getFullYear();
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
+
+  const input = document.getElementById("ordDate");
+  if (input) input.value = `${yyyy}-${mm}-${dd}`;
+}
+function openModal() {
+  if (!modal) return;
+  modal.classList.remove("hidden");
+  modal.setAttribute("aria-hidden", "false");
+
+  if (editingOrderId == null) {
+    resetOrderForm();
+    setTodayToDateInput();
+  }
+}
+
+function resetOrderForm() {
+  const qtyEl = document.getElementById("ordQty");
+  const prodEl = document.getElementById("ordProduct");
+  const unitEl = document.getElementById("ordUnitPrice");
+  const dateEl = document.getElementById("ordDate");
+  const info = document.getElementById("orderInfo");
+
+  if (qtyEl) qtyEl.value = "";
+  if (prodEl) prodEl.value = "damacana";
+  if (dateEl) dateEl.value = "";
+  if (info) info.textContent = "";
+
+  // ürün + ayarlara göre birim fiyatı tekrar bas
+  fillPriceFromSettings();
+
+  // imleç adet kutusunda olsun
+  setTimeout(() => qtyEl?.focus(), 0);
+}
+
+function closeModal() {
+  if (!modal) return;
+  modal.classList.add("hidden");
+  modal.setAttribute("aria-hidden", "true");
+  editingOrderId = null;
+  const btn = document.getElementById("btnSendWhatsapp");
+  if (btn) btn.textContent = "Siparişi Kaydet";
+  resetOrderForm(); // KAPANIRKEN SIFIRLA
+}
+
+function fillPriceFromSettings() {
+  const product = document.getElementById("ordProduct")?.value;
+  const priceInput = document.getElementById("ordUnitPrice");
+  if (!priceInput) return;
+
+  if (product === "damacana") priceInput.value = settings.priceDamacana || 0;
+  if (product === "pet05") priceInput.value = settings.pricePet05 || 0;
+}
+
+// Yeni Sipariş kartına basınca aç
+document.querySelector(".card-order")?.addEventListener("click", () => {
+  if (!canAddOrder()) {
+    uiOpen({
+      title: "Yetki Yok ⛔",
+      subtitle: "Sipariş veremezsin",
+      body: "Sipariş vermek için hesabın 'aktif' olmalı (admin onayı gerekir).",
+      okText: "Tamam",
+      showCancel: false,
+    });
+    return;
+  }
+
+  openModal();
+});
+
+// modal kapatma
+document.getElementById("closeModalBg")?.addEventListener("click", closeModal);
+document.getElementById("closeModalX")?.addEventListener("click", closeModal);
+
+// ürün değişince fiyat otomatik güncellensin
+document
+  .getElementById("ordProduct")
+  ?.addEventListener("change", fillPriceFromSettings);
+
+/* ================== WHATSAPP (APP ÖNCELİKLİ + FALLBACK) ================== */
+function buildWhatsappWebLink(phone, message) {
+  const msg = encodeURIComponent(message);
+  return `https://wa.me/${phone}?text=${msg}`;
+}
+
+function buildWhatsappDeepLink(phone, message) {
+  const msg = encodeURIComponent(message);
+  return `whatsapp://send?phone=${phone}&text=${msg}`;
+}
+
+function buildWhatsappIntentLink(phone, message) {
+  const msg = encodeURIComponent(message);
+  // Android’de WhatsApp app’e daha agresif yönlendirme
+  return `intent://send?phone=${phone}&text=${msg}#Intent;scheme=whatsapp;package=com.whatsapp;end`;
+}
+
+function openWhatsApp(phone, message) {
+  const ua = navigator.userAgent || "";
+  const isAndroid = /Android/i.test(ua);
+  const isIOS = /iPhone|iPad|iPod/i.test(ua);
+
+  const web = buildWhatsappWebLink(phone, message);
+  const deep = buildWhatsappDeepLink(phone, message);
+  const intent = buildWhatsappIntentLink(phone, message);
+
+  // Desktop: web yeni sekme
+  if (!isAndroid && !isIOS) {
+    window.open(web, "_blank");
+    return;
+  }
+
+  // ✅ Mobil: sayfayı TERK ETMEDEN deep link dene (hidden iframe)
+  const iframe = document.createElement("iframe");
+  iframe.style.display = "none";
+  iframe.src = deep;
+  document.body.appendChild(iframe);
+
+  // Android'de intent daha sağlam olabiliyor (bazı cihazlarda)
+  if (isAndroid) {
+    setTimeout(() => {
+      const iframe2 = document.createElement("iframe");
+      iframe2.style.display = "none";
+      iframe2.src = intent;
+      document.body.appendChild(iframe2);
+      setTimeout(() => iframe2.remove(), 800);
+    }, 150);
+  }
+
+  // ✅ Deep link çalışmazsa: web'i yeni sekmede aç (ana sayfa aynı kalsın)
+  setTimeout(() => {
+    window.open(web, "_blank");
+  }, 1200);
+
+  // temizlik
+  setTimeout(() => iframe.remove(), 800);
+}
+
+document.getElementById("btnSendWhatsapp")?.addEventListener("click", () => {
+  const info = document.getElementById("orderInfo");
+
+  const qtyRaw = document.getElementById("ordQty")?.value;
+  const qty = Number(qtyRaw);
+
+  if (!qtyRaw || isNaN(qty) || qty < 1) {
+    if (info) info.textContent = "❗ Lütfen adet gir (en az 1).";
+    showToast("Lütfen adet gir (en az 1).", "error");
+    return;
+  }
+
+  // ✅ Birim fiyat ayarlarda tanımlı mı?
+  const product = document.getElementById("ordProduct")?.value;
+  const needSettingPrice =
+    product === "damacana"
+      ? Number(settings.priceDamacana || 0)
+      : Number(settings.pricePet05 || 0);
+
+  if (!needSettingPrice || isNaN(needSettingPrice) || needSettingPrice <= 0) {
+    if (info)
+      info.textContent =
+        "❗ Birim fiyat ayarlarda tanımlı değil. Ayarlardan birim fiyatı gir.";
+    showToast(
+      "Birim fiyat ayarlarda tanımlı değil. Ayarlara yönlendiriyorum…",
+      "error",
+    );
+    // Admin değilse ayarlara yönlendirme yok
+    if (!isAdminActive()) {
+      uiOpen({
+        title: "Birim fiyat tanımlı değil",
+        subtitle: "Admin ayarlamalı",
+        body: "Sipariş verebilmek için birim fiyatın admin tarafından Ayarlar'dan girilmesi gerekiyor.",
+        okText: "Tamam",
+        showCancel: false,
+      });
+      return;
+    }
+
+    uiConfirm({
+      title: "Birim fiyat tanımlı değil",
+      subtitle: "Önce Ayarlar’dan birim fiyatı tanımlamalısın.",
+      body: "Ayarlar sayfasına gidelim mi?",
+      okText: "Ayarlar'a Git",
+      cancelText: "Vazgeç",
+      onOk: () => {
+        closeModal();
+        showPage("ayarlar");
+        setTimeout(() => {
+          if (product === "damacana")
+            document.getElementById("inpPriceDamacana")?.focus();
+          else document.getElementById("inpPricePet05")?.focus();
+        }, 150);
+      },
+    });
+
+    return;
+  }
+
+  const unit =
+    product === "damacana"
+      ? Number(settings.priceDamacana || 0)
+      : Number(settings.pricePet05 || 0);
+
+  // ekranda da ayar fiyatını gösterelim
+  const unitEl = document.getElementById("ordUnitPrice");
+  if (unitEl) unitEl.value = String(unit);
+
+  const productName = product === "damacana" ? "Damacana" : "0,5L Pet Şişe";
+
+  const dateVal = document.getElementById("ordDate")?.value; // YYYY-MM-DD
+  const message = `${qty} adet ${productName} alabilir miyiz?`;
+
+  // ✅ 1) Önce kaydet (düzenleme/yeni) — WhatsApp’a bakmadan
+  if (editingOrderId != null) {
+    const idx = orders.findIndex(
+      (x) => Number(x.id) === Number(editingOrderId),
+    );
+    if (idx > -1) {
+      const orderDate = dateVal ? new Date(dateVal) : new Date();
+      const oldPaid = Number(orders[idx].paidQty || 0);
+      const newPaid = Math.min(oldPaid, qty);
+
+      orders[idx] = {
+        ...orders[idx],
+        product,
+        qty,
+        paidQty: newPaid,
+        unitPrice: unit,
+        total: qty * unit,
+        date: orderDate.toISOString(),
+      };
+
+      saveOrders(orders);
+      console.log("UPDATE ->", orders[idx]);
+      updateOrderOnSheet(orders[idx]).catch(console.warn);
+
+      renderOrders();
+      renderSummary();
+      if (typeof renderDebtTable === "function") renderDebtTable();
+    }
+
+    editingOrderId = null;
+    showToast("Sipariş güncellendi ✅", "success");
+  } else {
+    addOrder({
+      product,
+      qty,
+      unitPrice: unit,
+      date: dateVal,
+    });
+    showToast("Sipariş kaydedildi ✅", "success");
+  }
+
+  // ✅ 2) Sonra “Gönderelim mi?” popup’u aç
+  const phone = (settings.whatsapp || "").replace(/\D/g, "");
+
+  uiConfirm({
+    title: "Mesaj gönderilsin mi?",
+    subtitle: phone
+      ? `WhatsApp no: ${phone}`
+      : "WhatsApp no: (Ayarlar → WhatsApp no gir)",
+    body: message,
+    okText: "WhatsApp’ta Aç",
+    cancelText: "Vazgeç",
+
+    onOk: () => {
+      // Gönder'e basınca numara zorunlu
+      if (!phone || phone.length < 10) {
+        if (info)
+          info.textContent =
+            "❗ WhatsApp numarası ayarlardan doğru girilmeli (90 ile, boşluksuz).";
+        showToast(
+          "WhatsApp numarası ayarlardan doğru girilmeli (90 ile, boşluksuz).",
+          "error",
+        );
+        return; // popup açık kalsın
+      }
+
+      openWhatsApp(phone, message);
+
+      showToast("WhatsApp açılıyor…", "info", 1400);
+      closeModal();
+
+      // ✅ Siparişten hemen sonra: "Yedek indirilsin mi?" popup'u (sadece WhatsApp’a gidince)
+      const niceDate = dateVal || new Date().toISOString().slice(0, 10);
+      const pName = product === "damacana" ? "Damacana" : "0,5L Pet Şişe";
+      const total2 = (qty * unit).toFixed(2);
+
+      uiConfirm({
+        title: "Yedek Alalım mı? 📦",
+        subtitle: "Sipariş kaydedildi. İndirilenler’e JSON yedeği atalım mı?",
+        body: `${niceDate} | ${qty} adet ${pName}\nTutar: ${total2} ₺\n\nNot: İndirilenler’de aynı dosya adına kaydedilir.`,
+        okText: "📥 İndir",
+        cancelText: "Sonra",
+        onOk: () => {
+          if (typeof downloadBackupJson === "function") downloadBackupJson();
+        },
+      });
+    },
+
+    onCancel: () => {
+      // Vazgeç: sipariş zaten kaydedildi -> sadece ekranı kapat
+      if (info) info.textContent = "";
+      closeModal();
+    },
+  });
+});
+
+/* ================== EVRENSEL POPUP SİSTEMİ ================== */
+const uiDialog = document.getElementById("uiDialog");
+let uiOkAction = null;
+let uiCancelAction = null;
+
+function uiClose() {
+  if (!uiDialog) return;
+
+  // ✅ Kapatmadan önce focus'u bırak (aria-hidden uyarısını keser)
+  if (document.activeElement && uiDialog.contains(document.activeElement)) {
+    document.activeElement.blur();
+  }
+
+  uiDialog.classList.add("hidden");
+  uiDialog.setAttribute("aria-hidden", "true");
+
+  // ✅ focus ve tıklamayı tamamen kilitle (modern çözüm)
+  uiDialog.inert = true;
+
+  uiOkAction = null;
+  uiCancelAction = null;
+}
+
+function uiOpen({
+  title = "Bilgi",
+  subtitle = "",
+  body = "",
+  okText = "Tamam",
+  cancelText = "Vazgeç",
+  showCancel = true,
+  onOk = null,
+  onCancel = null,
+} = {}) {
+  document.getElementById("uiTitle").textContent = title;
+  document.getElementById("uiSubtitle").textContent = subtitle;
+  document.getElementById("uiBody").innerHTML = body;
+
+  const okBtn = document.getElementById("uiOkBtn");
+  const cancelBtn = document.getElementById("uiCancelBtn");
+
+  okBtn.textContent = okText;
+  cancelBtn.textContent = cancelText;
+  cancelBtn.style.display = showCancel ? "" : "none";
+
+  uiOkAction = onOk;
+  uiCancelAction = onCancel;
+
+  uiDialog.inert = false;
+  uiDialog.classList.remove("hidden");
+  uiDialog.setAttribute("aria-hidden", "false");
+}
+
+document.getElementById("uiCloseBg")?.addEventListener("click", () => {
+  if (typeof uiCancelAction === "function") uiCancelAction();
+  uiClose();
+});
+document.getElementById("uiCloseX")?.addEventListener("click", () => {
+  if (typeof uiCancelAction === "function") uiCancelAction();
+  uiClose();
+});
+document.getElementById("uiCancelBtn")?.addEventListener("click", () => {
+  if (typeof uiCancelAction === "function") uiCancelAction();
+  uiClose();
+});
+document.getElementById("uiOkBtn")?.addEventListener("click", (e) => {
+  e.preventDefault();
+  const act = uiOkAction; // referansı tut
+  if (typeof act === "function") act(); // window.open burada, tıklama anında
+  uiClose();
+});
+
+function uiConfirm({
+  title,
+  subtitle = "",
+  body = "",
+  okText = "Tamam",
+  cancelText = "Vazgeç",
+  onOk,
+  onCancel,
+}) {
+  uiOpen({
+    title,
+    subtitle,
+    body,
+    okText,
+    cancelText,
+    showCancel: true,
+    onOk,
+    onCancel,
+  });
+}
+function doLogoutConfirm() {
+  toggleAccountMenu(false);
+
+  uiConfirm({
+    title: "Çıkış yapılsın mı?",
+    subtitle: currentUser?.username
+      ? `${currentUser.username} hesabından çıkış yapılacak.`
+      : "",
+    body: "Devam edelim mi?",
+    okText: "Çıkış",
+    cancelText: "Vazgeç",
+    onOk: () => {
+      uiClose();
+      clearSession();
+      currentUser = null;
+      location.reload();
+    },
+  });
+}
+
+// Popup sistemi hazır → artık otomatik yedek sorusunu güvenle açabiliriz
+
+function addOrder({ product, qty, unitPrice, date }) {
+  const orderDate = date ? new Date(date) : new Date();
+
+  const order = {
+    id: Date.now(),
+    product,
+    qty,
+    paidQty: 0,
+    unitPrice,
+    total: qty * unitPrice,
+    date: orderDate.toISOString(),
+  };
+
+  orders.push(order);
+  currentPage = 1;
+
+  saveOrders(orders);
+  // Google Sheets'e de yaz (SADECE YENİ SİPARİŞTE)
+  pushOrderToSheet(order).catch(console.warn);
+
+  renderOrders();
+  renderSummary();
+}
+
+function formatDateTR(iso) {
+  try {
+    return new Date(iso).toLocaleString("tr-TR");
+  } catch {
+    return iso || "";
+  }
+}
+function formatMoneyTR(value) {
+  const n = Number(value || 0);
+  return n.toLocaleString("tr-TR", {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  });
+}
+
+function requireAdmin(actionLabel = "Bu işlem") {
+  if (typeof isAdminActive !== "function" || !isAdminActive()) {
+    uiOpen({
+      title: "Yetki Yok ⛔",
+      subtitle: `${actionLabel} sadece admin yapabilir`,
+      body: "Bu hesabın bu işlemi yapmaya yetkisi yok.",
+      okText: "Tamam",
+      showCancel: false,
+    });
+    showToast?.("Yetki yok (admin gerekir)", "error");
+    return false;
+  }
+  return true;
+}
+
+function renderOrders() {
+  const host = document.getElementById("ordersList");
+  const meta = document.getElementById("ordersMeta");
+  const visibleOrders = orders.filter((o) => !orderDeletedStamp(o));
+
+  if (!host) return;
+
+  if (meta) meta.textContent = `${visibleOrders.length} kayıt`;
+
+  if (visibleOrders.length === 0) {
+    host.innerHTML = `<div style="padding:12px; color: rgba(156,163,175,0.95);">Henüz sipariş yok.</div>`;
+    return;
+  }
+  // ---- sayfalama için sıralı liste ----
+  const sorted = visibleOrders
+    .slice()
+    .sort(
+      (a, b) =>
+        new Date(b.date) - new Date(a.date) || (b.id || 0) - (a.id || 0),
+    );
+
+  const totalPages = Math.max(1, Math.ceil(sorted.length / PAGE_SIZE));
+
+  // currentPage sınır kontrol
+  if (currentPage > totalPages) currentPage = totalPages;
+  if (currentPage < 1) currentPage = 1;
+
+  const start = (currentPage - 1) * PAGE_SIZE;
+  const pageItems = sorted.slice(start, start + PAGE_SIZE);
+  const canManage = isAdminActive();
+
+  const rows = pageItems
+    .map((o) => {
+      const paid = Number(o.paidQty || 0);
+      const qty = Number(o.qty || 0);
+      const unit = Number(o.unitPrice || 0);
+      const total = Number(o.total || qty * unit);
+      const customer = settings.firmaAdi || "ABDULLAH ÖZER";
+      const note = o.product === "damacana" ? "DAMACANA" : "0,5L PET";
+      let statusIcon = "❌"; // hiç ödenmediyse
+      if (paid > 0 && paid < qty) statusIcon = "⚠️"; // kısmi
+      if (paid >= qty) statusIcon = "✅"; // tamamı ödendi
+
+      return `
+                
+                <tr>
+                <td>${formatDateTR(o.date).split(" ")[0]}</td>
+                <td class="td-num">${qty}</td>
+                <td>
+                <div class="paid-inline">
+                    ${
+                      paid >= qty
+                        ? `<span class="paid-chip ok">✅ ${paid}/${qty}</span>`
+                        : paid > 0
+                          ? `<span class="paid-chip warn">⚠️ ${paid}/${qty}</span>`
+                          : `<span class="paid-chip no">❌ ${paid}/${qty}</span>`
+                    }
+            <div class="pbar">
+            <div class="pbar-fill ${
+              paid >= qty ? "ok" : paid > 0 ? "warn" : "no"
+            }" style="width:${qty ? Math.min(100, (paid / qty) * 100) : 0}%"></div>
+                    </div>
+                </div>
+                </td>
+
+                </td>
+                <td>${unit.toFixed(2)} ₺</td>
+                <td class="td-num">${total.toFixed(2)} ₺</td>
+                <td class="td-num">${note}</td>
+                <td>${o.createdBy || "-"}</td>
+                <td class="td-right">
+                    ${
+                      typeof isAdminActive === "function" && isAdminActive()
+                        ? `<div class="icon-actions">
+                <button class="ico-btn ico-edit" data-act="edit" data-id="${o.id}" title="Düzenle">✏️</button>
+                <button class="ico-btn ico-del"  data-act="del"  data-id="${o.id}" title="Sil">🗑️</button>
+                </div>`
+                        : `<div class="icon-actions" style="opacity:.45; font-weight:700;">—</div>`
+                    }
+                    </td>
+
+
+                    
+               
+                <td>${statusIcon}</td>
+                </tr>
+                `;
+    })
+    .join("");
+
+  host.innerHTML = `
+            
+                <div class="orders-syncbar">
+                <div>
+                <div class="orders-sync-title">Firebase senkron</div>
+                <div class="sync-meta" id="ordersLastSyncText">Son senkron: -</div>
+                </div>
+
+                <button id="btnRefresh" class="mini-refresh" title="Firebase'den yenile">⟳</button>
+
+            </div>
+
+            <table class="orders-table">
+                <thead>
+                <tr>
+                    <th>Tarih</th>
+                    <th>Adet</th>
+                    <th>Ödenen Adet</th>
+                    <th>Birim (₺)</th>
+                    <th>Toplam (₺)</th>
+                    <th>Not</th>
+                    <th>Kaydeden</th>
+                    <th class="td-right">İşlem</th>
+                    <th>Durum</th>
+                </tr>
+                </thead>
+                <tbody>${rows}</tbody>
+            </table>
+            `;
+
+  // buton clickleri (event delegation)
+  host.querySelectorAll("button[data-act]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const id = Number(btn.dataset.id);
+      const act = btn.dataset.act;
+      if (act === "edit") startEditOrder(id);
+      if (act === "del") deleteOrder(id);
+    });
+  });
+
+  // ---- pager güncelle ----
+  const pagerInfo = document.getElementById("pageInfo");
+  const prev = document.getElementById("btnPrevPage");
+  const next = document.getElementById("btnNextPage");
+
+  if (pagerInfo) pagerInfo.textContent = `Sayfa ${currentPage} / ${totalPages}`;
+  if (prev) prev.disabled = currentPage <= 1;
+  if (next) next.disabled = currentPage >= totalPages;
+  // 🔄 Yenile butonu (her render sonrası yeniden bağla) ✅ spinner + saat + toast
+  const btnRefresh = document.getElementById("btnRefresh");
+  if (btnRefresh) {
+    btnRefresh.onclick = async () => {
+      btnRefresh.classList.add("is-spinning");
+      try {
+        await syncOrdersFromSheet();
+        setOrdersLastSync(new Date());
+      } catch (e) {
+        console.warn(e);
+        showToast?.("Firebase verisi alınamadı", "error");
+      } finally {
+        btnRefresh.classList.remove("is-spinning");
+      }
+    };
+  }
+}
+function renderOrdersTable() {
+  const start = (ordersPage - 1) * ORDERS_PER_PAGE;
+  const end = start + ORDERS_PER_PAGE;
+
+  const pageOrders = orders.slice(start, end);
+
+  document.getElementById("pageInfo").textContent =
+    `Sayfa ${ordersPage} / ${totalOrdersPages}`;
+}
+
+function deleteOrder(id, afterDelete) {
+  if (!isAdminActive()) {
+    showToast("Bu işlem sadece admin içindir.");
+    return;
+  }
+  if (!requireAdmin("Sipariş silme")) return;
+
+  const o = orders.find((x) => Number(x.id) === Number(id));
+  if (!o) return;
+
+  const name = o.product === "damacana" ? "Damacana" : "0,5L Pet";
+  const preview = `${name} | ${o.qty} adet | ${o.total} ₺ | ${formatDateTR(o.date)}`;
+
+  uiConfirm({
+    title: "Siparişi Sil",
+    subtitle: "Bu işlem geri alınamaz",
+    body: preview,
+    okText: "Sil",
+    cancelText: "Vazgeç",
+    onOk: async () => {
+      // ✅ soft delete (çöp kutusuna taşı)
+      const idx = orders.findIndex((x) => Number(x.id) === Number(id));
+      if (idx === -1) return;
+
+      orders[idx].deletedAt = Date.now();
+      updateTrashBadge();
+
+      saveOrders(orders);
+
+      // ✅ Google Sheets tarafında da arşivle
+      await archiveOrderOnSheet(id);
+
+      currentPage = 1;
+      renderOrders();
+
+      renderSummary();
+
+      if (typeof afterDelete === "function") afterDelete();
+      if (typeof renderDebtTable === "function") renderDebtTable();
+      if (typeof showToast === "function")
+        showToast("Sipariş çöp kutusuna taşındı 🗑️", "info");
+    },
+  });
+}
+function applyPaymentFIFO(payQty) {
+  let remaining = Number(payQty || 0);
+  if (!remaining || remaining < 1) return;
+
+  // orders dizisinin KENDİSİNİ tarihe göre sırala (kopya yok)
+  orders.sort((a, b) => new Date(a.date) - new Date(b.date));
+
+  for (let i = 0; i < orders.length; i++) {
+    if (remaining <= 0) break;
+
+    const o = orders[i];
+    const qty = Number(o.qty || 0);
+    const paid = Number(o.paidQty || 0);
+    const left = qty - paid;
+
+    if (left <= 0) continue;
+
+    const add = Math.min(left, remaining);
+    o.paidQty = paid + add;
+    remaining -= add;
+  }
+
+  saveOrders(orders);
+
+  renderOrders();
+  renderSummary();
+}
+function applyPaymentFIFOToOrders(ordersList, payQty) {
+  let remaining = Number(payQty || 0);
+  if (!remaining || remaining < 1) return;
+
+  // en eski siparişten düş
+  ordersList.sort((a, b) => new Date(a.date) - new Date(b.date));
+
+  for (let i = 0; i < ordersList.length; i++) {
+    if (remaining <= 0) break;
+
+    const o = ordersList[i];
+    const qty = Number(o.qty || 0);
+    const paid = Number(o.paidQty || 0);
+    const left = qty - paid;
+    if (left <= 0) continue;
+
+    const add = Math.min(left, remaining);
+    o.paidQty = paid + add;
+    remaining -= add;
+  }
+}
+
+function recomputePaidFromPayments() {
+  // 1) tüm siparişlerin paidQty'sini sıfırla
+  orders.forEach((o) => {
+    o.paidQty = 0;
+  });
+
+  // 2) ödeme listesi: silinmeyen + en eski önce
+  const sortedPays = (payments || [])
+     .filter((p) => !paymentDeletedStamp(p))
+    .slice()
+    .sort((a, b) => new Date(a.date) - new Date(b.date));
+
+  // 3) dashboard filtresine göre uygulanacak sipariş listesi
+  const visibleOrders = (orders || []).filter((o) => !orderDeletedStamp(o));
+  const targetOrders = visibleOrders; // her zaman tümü
+
+  // 4) her ödemeyi FIFO ile seçili yıl siparişlerine dağıt
+  for (const p of sortedPays) {
+    applyPaymentFIFOToOrders(targetOrders, Number(p.qty || 0));
+  }
+
+  // 5) kaydet + UI
+  saveOrders(orders);
+
+  renderOrders();
+  renderSummary();
+  if (typeof renderDebtTable === "function") renderDebtTable();
+}
+
+function refreshPaidStateFromPaymentsOnly() {
+  if (!Array.isArray(orders) || orders.length === 0) return;
+  if (!Array.isArray(payments) || payments.length === 0) {
+    saveOrders(orders);
+    return;
+  }
+  recomputePaidFromPayments();
+}
+
+function toDateInputValue(iso) {
+  try {
+    const d = new Date(iso);
+    const yyyy = d.getFullYear();
+    const mm = String(d.getMonth() + 1).padStart(2, "0");
+    const dd = String(d.getDate()).padStart(2, "0");
+    return `${yyyy}-${mm}-${dd}`;
+  } catch {
+    return "";
+  }
+}
+
+function startEditOrder(id) {
+  if (!requireAdmin("Sipariş düzenleme")) return;
+
+  const o = orders.find((x) => Number(x.id) === Number(id));
+  if (!o) return;
+
+  editingOrderId = Number(id);
+
+  // modal alanlarını doldur
+  document.getElementById("ordProduct").value = o.product;
+  document.getElementById("ordQty").value = o.qty;
+  document.getElementById("ordUnitPrice").value = o.unitPrice;
+
+  const dateEl = document.getElementById("ordDate");
+  if (dateEl) dateEl.value = toDateInputValue(o.date);
+
+  // buton yazısı "Güncelle" olsun
+  const btn = document.getElementById("btnSendWhatsapp");
+  if (btn) btn.textContent = "Güncelle";
+
+  openModal();
+}
+
+/* ================== BORÇ ALARM (Dashboard) ================== */
+let _lastDebtLevel = null; // "ok" | "warn" | "alarm"
+
+function playDebtAlarmBeeps(count = 3) {
+  // 3 kere kısa bip (tarayıcı bazen sesi engelleyebilir)
+  let i = 0;
+  const tick = () => {
+    i++;
+    try {
+      const AudioCtx = window.AudioContext || window.webkitAudioContext;
+      if (!AudioCtx) return;
+      const ctx = new AudioCtx();
+      const o = ctx.createOscillator();
+      const g = ctx.createGain();
+      o.type = "sine";
+      o.frequency.setValueAtTime(880, ctx.currentTime);
+      g.gain.setValueAtTime(0.0001, ctx.currentTime);
+      g.gain.exponentialRampToValueAtTime(0.22, ctx.currentTime + 0.02);
+      g.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + 0.18);
+      o.connect(g);
+      g.connect(ctx.destination);
+      o.start();
+      o.stop(ctx.currentTime + 0.22);
+      setTimeout(() => {
+        try {
+          ctx.close();
+        } catch {}
+      }, 300);
+    } catch {}
+
+    if (i < count) setTimeout(tick, 260);
+  };
+  tick();
+}
+
+function openPayAndFocus() {
+  // Senin projende modal açan fonksiyon neyse onu çağırıyoruz.
+  // (Hazır dosyada openPayModal kullanıldı; sende farklıysa aşağıyı değiştir.)
+  try {
+    openPayModal?.();
+  } catch {}
+
+  // modal açıldıktan sonra input’a focus
+  setTimeout(() => {
+    const inp =
+      document.querySelector("#payQty") ||
+      document.querySelector("#paymentQty") ||
+      document.querySelector("input[name='paymentQty']") ||
+      document.querySelector(".pay-modal input[type='number']") ||
+      document.querySelector("#modalPayment input");
+    if (inp) inp.focus();
+  }, 120);
+}
+
+function maybeShowDebtAlarm(level, kalanTl) {
+  // ✅ sadece admin görsün (EN BAŞTA)
+  if (!isAdminActive()) return;
+
+  if (level !== "alarm") {
+    _lastDebtLevel = level;
+    return;
+  }
+
+  // seviye alarm'a yeni geçtiyse 1 kere çalışsın
+  if (_lastDebtLevel === "alarm") return;
+  _lastDebtLevel = "alarm";
+
+  // aynı yıl filtresinde sayfa yenilenene kadar 1 kere popup
+  const key = "debtAlarmShown:" + String(dashYear == null ? "ALL" : dashYear);
+  if (sessionStorage.getItem(key) === "1") return;
+  sessionStorage.setItem(key, "1");
+
+  playDebtAlarmBeeps(3);
+
+  if (typeof uiConfirm === "function") {
+    uiConfirm({
+      title: "🚨 BORÇ ALARMI",
+      subtitle: `Kalan borç: ${formatMoneyTR(kalanTl)} ₺`,
+      body: "Kalan borç 4.000 ₺ üstünde. İstersen hemen kısmi ödeme girebilirsin.",
+      okText: "Ödeme Ekle",
+      cancelText: "Kapat",
+      onOk: openPayAndFocus,
+    });
+  } else {
+    const go = confirm(
+      `BORÇ ALARMI!\nKalan borç: ${formatMoneyTR(kalanTl)} ₺\n\nKısmi ödeme girmek ister misin?`,
+    );
+    if (go) openPayAndFocus();
+  }
+}
+
+function renderSummary() {
+  // ✅ Performanslı özet: cache’ten oku
+  const S = perfComputeSummaryForDashYear();
+
+  // 1) Toplam sipariş adedi (seçili yıl)
+  const toplamAdet = S.toplamAdet;
+
+  const toplamSiparisEl = document.getElementById("toplamSiparis");
+  if (toplamSiparisEl) toplamSiparisEl.textContent = `${toplamAdet} Adet`;
+
+  // 2) Toplam sipariş tutarı (seçili yıl)
+  const toplamSiparisTutari = S.toplamSiparisTutari;
+
+  // 3) Ödenen tutar (seçili yıl)
+  const odenenTutar = S.odenenTutar;
+
+  // 4) Kalan borç
+  const kalan = Math.max(0, toplamSiparisTutari - odenenTutar);
+
+  // 5) ✅ UI yazdırma
+  const elToplamBorc = document.getElementById("toplamBorc");
+  if (elToplamBorc)
+    elToplamBorc.textContent = formatMoneyTR(toplamSiparisTutari);
+
+  const elSag = document.getElementById("toplamBorcSag");
+  if (elSag) elSag.textContent = formatMoneyTR(toplamSiparisTutari);
+
+  const elKalan = document.getElementById("kalanBorc");
+  if (elKalan) elKalan.textContent = formatMoneyTR(kalan);
+
+  // ✅ Kalan borç seviye rengi + alarm
+  const debtCard = document.querySelector(".sum-item.danger");
+  if (debtCard) debtCard.classList.remove("debt-ok", "debt-warn", "debt-alarm");
+
+  let level = "ok";
+  if (kalan >= 4000) level = "alarm";
+  else if (kalan >= 3000) level = "warn";
+
+  if (debtCard) debtCard.classList.add("debt-" + level);
+  maybeShowDebtAlarm(level, kalan);
+
+  // 6) ✅ Kalan borç pili (adet bazlı)
+  const paidQtyAll = Number(S.paidQtyAll || 0);
+
+  const remainingQtyAll = Math.max(0, toplamAdet - paidQtyAll);
+  const pct =
+    toplamAdet > 0 ? Math.round((remainingQtyAll / toplamAdet) * 100) : 0;
+
+  const batteryFillEl = document.getElementById("debtBatteryFill");
+  const txt = document.getElementById("debtBatteryText");
+
+  if (batteryFillEl) batteryFillEl.style.width = pct + "%";
+  if (txt) txt.textContent = `${remainingQtyAll} adet kaldı (${pct}%)`;
+
+  // pil dolgusunu renklendir (class)
+  if (batteryFillEl) {
+    batteryFillEl.classList.remove("ok", "warn", "alarm");
+    batteryFillEl.classList.add(
+      level === "alarm" ? "alarm" : level === "warn" ? "warn" : "ok",
+    );
+  }
+}
+function renderBugunTarih() {
+  const el = document.getElementById("bugunTarih");
+  if (!el) return;
+
+  const d = new Date();
+  const tarih = d.toLocaleDateString("tr-TR", {
+    day: "2-digit",
+    month: "2-digit",
+    year: "numeric",
+  });
+
+  el.textContent = tarih;
+}
+
+/* ================== RAPORLAR (Aylık / Yıllık) ================== */
+let rptYear = new Date().getFullYear();
+let rptMonth = new Date().getMonth(); // 0-11
+let rptMode = "qty"; // "qty" | "total"
+let reportsBound = false;
+let rptAllYears = false;
+
+function ymFromIso(iso) {
+  try {
+    const d = new Date(iso);
+    return { y: d.getFullYear(), m: d.getMonth() };
+  } catch {
+    return { y: 0, m: 0 };
+  }
+}
+
+function calcYearStats(year) {
+  // 12 ay için: qty, total, paid (o ayın siparişleri üzerinden), remain
+  const months = Array.from({ length: 12 }, () => ({
+    qty: 0,
+    total: 0,
+    paid: 0,
+    remain: 0,
+  }));
+
+  // Siparişleri yıl/ay bazında topla
+  (orders || [])
+    .filter((o) => !orderDeletedStamp(o))
+    .forEach((o) => {
+      const { y, m } = ymFromIso(o.date);
+      if (y !== year) return;
+
+      const qty = Number(o.qty || 0);
+      const unit = Number(o.unitPrice || 0);
+      const total = qty * unit;
+
+      const paidQty = Math.min(qty, Number(o.paidQty || 0));
+      const paid = paidQty * unit;
+
+      months[m].qty += qty;
+      months[m].total += total;
+      months[m].paid += paid;
+    });
+
+  // remain hesapla
+  months.forEach((x) => {
+    x.remain = Math.max(0, x.total - x.paid);
+  });
+
+  return months;
+}
+function calcAllYearsFromYearStats_() {
+  // Eğer orders boşsa hiç uğraşma
+  if (
+    typeof orders === "undefined" ||
+    !Array.isArray(orders) ||
+    orders.length === 0
+  ) {
+    return Array.from({ length: 12 }, () => ({
+      qty: 0,
+      total: 0,
+      paid: 0,
+      remain: 0,
+    }));
+  }
+
+  const out = Array.from({ length: 12 }, () => ({
+    qty: 0,
+    total: 0,
+    paid: 0,
+    remain: 0,
+  }));
+  const years = getAvailableYears_();
+
+  for (const y of years) {
+    const months = calcYearStats(y); // 🔥 senin çalışan fonksiyon
+
+    for (let i = 0; i < 12; i++) {
+      out[i].qty += Number(months[i]?.qty || 0);
+      out[i].total += Number(months[i]?.total || 0);
+      out[i].paid += Number(months[i]?.paid || 0);
+      out[i].remain += Number(months[i]?.remain || 0);
+    }
+  }
+
+  return out;
+}
+
+function getAvailableYears_() {
+  const list =
+    typeof orders !== "undefined" && Array.isArray(orders) ? orders : [];
+
+  const years = new Set();
+  for (const o of list) {
+    const d = new Date(o.tarih || o.date || o.Tarih);
+    if (!isNaN(d.getTime())) years.add(d.getFullYear());
+  }
+
+  return Array.from(years).sort((a, b) => a - b);
+}
+
+function setKpisFromMonth(stats) {
+  const qtyEl = document.getElementById("rptKpiQty");
+  const totalEl = document.getElementById("rptKpiTotal");
+  const paidEl = document.getElementById("rptKpiPaid");
+  const remEl = document.getElementById("rptKpiRemain");
+
+  if (qtyEl) qtyEl.textContent = `${Math.round(stats.qty)} Adet`;
+  if (totalEl) totalEl.textContent = `${formatMoneyTR(stats.total)} ₺`;
+  if (paidEl) paidEl.textContent = `${formatMoneyTR(stats.paid)} ₺`;
+  if (remEl) remEl.textContent = `${formatMoneyTR(stats.remain)} ₺`;
+}
+
+function renderBars(yearMonths) {
+  const host = document.getElementById("rptBarsHost");
+  if (!host) return;
+
+  const labels = [
+    "Oca",
+    "Şub",
+    "Mar",
+    "Nis",
+    "May",
+    "Haz",
+    "Tem",
+    "Ağu",
+    "Eyl",
+    "Eki",
+    "Kas",
+    "Ara",
+  ];
+  const values = yearMonths.map((m) => (rptMode === "qty" ? m.qty : m.total));
+  const maxV = Math.max(1, ...values);
+  // 🔥 En yoğun ay (adet bazlı) index'i
+  const bestIdx = yearMonths.reduce((best, m, i) => {
+    return (m.qty || 0) > (yearMonths[best]?.qty || 0) ? i : best;
+  }, 0);
+  const hasAnyQty = yearMonths.some((m) => (m.qty || 0) > 0);
+
+  host.innerHTML = yearMonths
+    .map((m, i) => {
+      const val = rptMode === "qty" ? m.qty : m.total;
+      if (val === 0) return "";
+      const pct = Math.round((val / maxV) * 100);
+      const isActive = i === rptMonth;
+      const isBest = hasAnyQty && i === bestIdx;
+
+      const rightText =
+        rptMode === "qty"
+          ? `${Math.round(m.qty)}`
+          : `${formatMoneyTR(m.total)} ₺`;
+
+      return `
+      <button
+        class="mini-btn"
+        data-rpt-month="${i}"
+        style="
+          width:100%;
+          text-align:left;
+          padding:12px;
+          border-radius:16px;
+          display:flex;
+          align-items:center;
+          gap:10px;
+          justify-content:space-between;
+          border:1px solid rgba(148,163,184,0.30);
+          background: ${isActive ? "rgba(56,189,248,0.12)" : "rgba(15,23,42,0.45)"};
+        "
+      >
+        <div style="min-width:38px; font-weight:900;">
+        ${labels[i]}${isBest ? " 🔥" : ""}
+        </div>
+
+
+        <div style="flex:1; height:10px; border-radius:999px; background: rgba(148,163,184,0.22); overflow:hidden;">
+          <div style="height:100%; width:${pct}%; border-radius:999px; background: ${isBest ? "rgba(250,204,21,0.95)" : "rgba(56,189,248,0.9)"};"></div>
+        </div>
+
+        <div style="min-width:92px; text-align:right; font-weight:900;">${rightText}</div>
+      </button>
+    `;
+    })
+    .join("");
+
+  // bar click
+  host.querySelectorAll("button[data-rpt-month]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      rptMonth = Number(btn.dataset.rptMonth);
+      const sel = document.getElementById("rptMonthSelect");
+      if (sel) sel.value = String(rptMonth);
+      renderReports(); // yeniden çiz
+    });
+  });
+}
+
+function bindReportsUIOnce() {
+  if (reportsBound) return;
+  reportsBound = true;
+
+  document.getElementById("rptYearPrev")?.addEventListener("click", () => {
+    rptYear -= 1;
+    renderReports();
+  });
+
+  document.getElementById("rptYearNext")?.addEventListener("click", () => {
+    rptYear += 1;
+    renderReports();
+  });
+
+  document.getElementById("rptMonthSelect")?.addEventListener("change", (e) => {
+    rptMonth = Number(e.target.value || 0);
+    renderReports();
+  });
+
+  document.getElementById("rptChartMode")?.addEventListener("change", (e) => {
+    rptMode = String(e.target.value || "qty");
+    renderReports();
+  });
+}
+document
+  .getElementById("rptToggleMonthDetail")
+  ?.addEventListener("click", () => {
+    rptMonthDetailOpen = !rptMonthDetailOpen;
+    renderReports();
+  });
+const allBtn = document.getElementById("rptAllYearsBtn");
+if (allBtn && !allBtn.dataset.bound) {
+  allBtn.dataset.bound = "1";
+  allBtn.addEventListener("click", () => {
+    rptAllYears = !rptAllYears;
+    allBtn.classList.toggle("active", rptAllYears);
+
+    // Tümü moduna geçince ay seçimini Ocak'a çekmek istersen:
+    // rptMonth = 0;
+
+    renderReports();
+  });
+}
+
+function renderReports() {
+  bindReportsUIOnce();
+  const prevBtn = document.getElementById("rptPrevYearBtn");
+  const nextBtn = document.getElementById("rptNextYearBtn");
+
+  if (prevBtn) prevBtn.disabled = rptAllYears;
+  if (nextBtn) nextBtn.disabled = rptAllYears;
+
+  // yıl label
+  const yearEl = document.getElementById("rptYearLabel");
+  if (yearEl) yearEl.textContent = rptAllYears ? "Tüm Yıllar" : String(rptYear);
+
+  // ay select sync
+  const monthSel = document.getElementById("rptMonthSelect");
+  if (monthSel) monthSel.value = String(rptMonth);
+
+  // hesapla
+  const months = rptAllYears
+    ? calcAllYearsFromYearStats_()
+    : calcYearStats(rptYear);
+
+  // ===== Yıllık özet hesapları =====
+  const monthNames = [
+    "Ocak",
+    "Şubat",
+    "Mart",
+    "Nisan",
+    "Mayıs",
+    "Haziran",
+    "Temmuz",
+    "Ağustos",
+    "Eylül",
+    "Ekim",
+    "Kasım",
+    "Aralık",
+  ];
+
+  const yearQty = months.reduce((s, m) => s + (m.qty || 0), 0);
+  const yearTotal = months.reduce((s, m) => s + (m.total || 0), 0);
+  const yearPaid = months.reduce((s, m) => s + (m.paid || 0), 0);
+  const yearRemain = Math.max(0, yearTotal - yearPaid);
+
+  // En yüksek / en düşük ay (0 olan ayları "en düşük" hesabına sokmayalım)
+  const nonZero = months
+    .map((m, i) => ({ ...m, i }))
+    .filter((x) => (x.qty || 0) > 0);
+
+  let bestText = "--";
+  let worstText = "--";
+
+  if (nonZero.length > 0) {
+    const best = nonZero.reduce((a, b) => (b.qty > a.qty ? b : a));
+    const worst = nonZero.reduce((a, b) => (b.qty < a.qty ? b : a));
+
+    bestText = `${monthNames[best.i]} • ${Math.round(best.qty)} Adet`;
+    worstText = `${monthNames[worst.i]} • ${Math.round(worst.qty)} Adet`;
+  }
+
+  // UI yazdır
+  const yq = document.getElementById("rptYearTotalQty");
+  const yr = document.getElementById("rptYearRemainMoney");
+  const bestLine = document.getElementById("rptBestMonthLine");
+  const yt = document.getElementById("rptYearTotalMoney");
+  if (yt) yt.textContent = `${formatMoneyTR(yearTotal)} ₺`;
+
+  if (bestLine) {
+    bestLine.textContent =
+      bestText !== "--"
+        ? rptAllYears
+          ? `Tüm yıllarda en yoğun ay: ${bestText}`
+          : `En yoğun ay: ${bestText}`
+        : rptAllYears
+          ? `Henüz veri yok.`
+          : `Bu yıl için henüz veri yok.`;
+  }
+
+  if (yq) yq.textContent = `${Math.round(yearQty)} Adet`;
+  if (yr) yr.textContent = `${formatMoneyTR(yearRemain)} ₺`;
+
+  // KPI
+  setKpisFromMonth(
+    months[rptMonth] || { qty: 0, total: 0, paid: 0, remain: 0 },
+  );
+  // ===== Tek satır aylık özet =====
+  const oneLine = document.getElementById("rptMonthOneLine");
+  if (oneLine) {
+    const monthNames = [
+      "Ocak",
+      "Şubat",
+      "Mart",
+      "Nisan",
+      "Mayıs",
+      "Haziran",
+      "Temmuz",
+      "Ağustos",
+      "Eylül",
+      "Ekim",
+      "Kasım",
+      "Aralık",
+    ];
+    const m = months[rptMonth] || { qty: 0, total: 0, paid: 0, remain: 0 };
+    const years = rptAllYears ? getAvailableYears_() : [rptYear];
+    const yearText = rptAllYears
+      ? `${years[0]}-${years[years.length - 1]}`
+      : String(rptYear);
+
+    oneLine.textContent =
+      `${monthNames[rptMonth]} ${yearText} • ` +
+      `${Math.round(m.qty)} Adet • ` +
+      `${formatMoneyTR(m.remain)} ₺ Kalan`;
+  }
+  const breakdownEl = document.getElementById("rptMonthYearBreakdown");
+  if (breakdownEl) {
+    if (rptAllYears) {
+      const monthNames = [
+        "Ocak",
+        "Şubat",
+        "Mart",
+        "Nisan",
+        "Mayıs",
+        "Haziran",
+        "Temmuz",
+        "Ağustos",
+        "Eylül",
+        "Ekim",
+        "Kasım",
+        "Aralık",
+      ];
+      const mname = monthNames[rptMonth].toUpperCase();
+
+      const byYear = calcMonthByYearQty_(orders, rptMonth);
+
+      const years = Object.keys(byYear)
+        .map(Number)
+        .sort((a, b) => a - b);
+
+      let html = `<div class="title">${mname} AYI</div>`;
+      if (years.length === 0) {
+        html += `<div class="row"><span class="y">Veri yok</span><span class="v">0 adet</span></div>`;
+      } else {
+        // max / min bul
+        let maxY = null,
+          minY = null;
+        let maxV = -Infinity,
+          minV = Infinity;
+
+        for (const y of years) {
+          const v = Number(byYear[y] || 0);
+          if (v > maxV) {
+            maxV = v;
+            maxY = y;
+          }
+          if (v < minV) {
+            minV = v;
+            minY = y;
+          }
+        }
+
+        // satırları yaz
+        for (const y of years) {
+          const v = Math.round(byYear[y] || 0);
+          const cls = y === maxY ? "row max" : y === minY ? "row min" : "row";
+
+          html += `
+    <div class="${cls}">
+      <span class="y">${y}</span>
+      <span class="v">${v} adet</span>
+    </div>
+  `;
+        }
+      }
+
+      breakdownEl.innerHTML = html;
+      breakdownEl.style.display = "block";
+    } else {
+      breakdownEl.style.display = "none";
+      breakdownEl.innerHTML = "";
+    }
+  }
+
+  // Seçili Ay KPI detaylarını aç/kapat
+  const grid = document.getElementById("rptMonthKpiGrid");
+  const btn = document.getElementById("rptToggleMonthDetail");
+  if (grid) grid.style.display = rptMonthDetailOpen ? "grid" : "none";
+  if (btn) btn.textContent = rptMonthDetailOpen ? "Kapat" : "Detay";
+
+  // grafik
+  renderBars(months);
+}
+
+renderOrders();
+renderSummary();
+renderDashYearLabel(true);
+renderDashboard();
+renderBugunTarih();
+
+document.getElementById("btnPrevPage")?.addEventListener("click", () => {
+  if (typeof currentPage !== "number") currentPage = 1;
+  if (currentPage > 1) currentPage--;
+  renderOrders();
+});
+
+document.getElementById("btnNextPage")?.addEventListener("click", () => {
+  if (typeof currentPage !== "number") currentPage = 1;
+  currentPage++;
+  renderOrders(); // renderOrders içinde zaten totalPages'e göre geri sınırlar
+});
+
+function calcMonthByYearQty_(list, monthIndex) {
+  const map = {}; // {2023: 6, 2024: 5}
+
+  for (const o of Array.isArray(list) ? list : []) {
+    const raw = o.tarih ?? o.date ?? o.Tarih ?? o.t ?? "";
+    const d = new Date(raw);
+    if (isNaN(d.getTime())) continue;
+    if (d.getMonth() !== monthIndex) continue;
+
+    const y = d.getFullYear();
+    map[y] = (map[y] || 0) + Number(o.adet || o.qty || 0);
+  }
+
+  return map;
+}
+
+/* ================== KALAN BORÇ MODAL ================== */
+const debtModal = document.getElementById("debtModal");
+const debtHost = document.getElementById("debtTableHost");
+
+function openDebtModal() {
+  if (!requireLoginOrOpenAuth()) return;
+  if (!debtModal) return;
+  renderDebtTable();
+  debtModal.classList.remove("hidden");
+  debtModal.setAttribute("aria-hidden", "false");
+}
+
+function closeDebtModal() {
+  if (!debtModal) return;
+  debtModal.classList.add("hidden");
+  debtModal.setAttribute("aria-hidden", "true");
+}
+
+/* Kalan Borç kartına tıklayınca aç */
+document
+  .querySelector(".sum-item.danger")
+  ?.addEventListener("click", openDebtModal);
+
+document
+  .getElementById("closeDebtBg")
+  ?.addEventListener("click", closeDebtModal);
+document
+  .getElementById("closeDebtX")
+  ?.addEventListener("click", closeDebtModal);
+
+/* Borç satırları: kalan adet > 0 olan siparişler (en eski üstte) */
+function getDebtItems() {
+  return orders
+    .filter((o) => !orderDeletedStamp(o))
+    .slice()
+    .map((o) => {
+      const qty = Number(o.qty || 0);
+      const paid = Number(o.paidQty || 0);
+      const remainingQty = Math.max(0, qty - paid);
+      const unit = Number(o.unitPrice || 0);
+      return { ...o, remainingQty, unit, remainingTotal: remainingQty * unit };
+    })
+    .filter((x) => x.remainingQty > 0)
+    .sort((a, b) => new Date(a.date) - new Date(b.date));
+}
+
+function formatDateShortTR(iso) {
+  try {
+    const d = new Date(iso);
+    const dd = String(d.getDate()).padStart(2, "0");
+    const mm = String(d.getMonth() + 1).padStart(2, "0");
+    const yy = d.getFullYear();
+    return `${dd}.${mm}.${yy}`;
+  } catch {
+    return "";
+  }
+}
+
+function renderDebtTable() {
+  if (!debtHost) return;
+
+  const list = getDebtItems(); // FIFO mantığı için dokunmuyoruz
+
+  // ✅ SADECE TABLODA GÖSTERİM: en yeni sipariş üstte
+  const displayList = list
+    .slice()
+    .sort(
+      (a, b) =>
+        new Date(b.date) - new Date(a.date) || (b.id || 0) - (a.id || 0),
+    );
+
+  const totalQty = list.reduce((s, x) => s + Number(x.remainingQty || 0), 0);
+  const totalTl = list.reduce((s, x) => s + Number(x.remainingTotal || 0), 0);
+
+  const totalsEl = document.getElementById("debtTotals");
+  if (totalsEl)
+    totalsEl.textContent = `${totalQty} adet • ${formatMoneyTR(totalTl)} ₺`;
+
+  if (list.length === 0) {
+    debtHost.innerHTML = `<div style="padding:12px; color: rgba(156,163,175,95);">Kalan borç yok 🎉</div>`;
+    return;
+  }
+
+  const rows = displayList
+    .map(
+      (o) => `
+
+    <tr>
+      <td>${formatDateShortTR(o.date)}</td>
+      <td style="text-align:right;">${o.remainingQty}</td>
+      <td style="text-align:right;">${formatMoneyTR(Number(o.unitPrice || 0))} ₺</td>
+      <td style="text-align:right;">${formatMoneyTR(o.remainingQty * Number(o.unitPrice || 0))} ₺</td>
+      <td style="text-align:right; white-space:nowrap;">
+        <button class="ico-btn ico-edit" data-debt-act="edit" data-id="${o.id}">✏️</button>
+        <button class="ico-btn ico-del"  data-debt-act="del"  data-id="${o.id}">🗑️</button>
+      </td>
+    </tr>
+  `,
+    )
+    .join("");
+
+  // ✅ debtTableHost zaten class="table-wrap" olduğu için sadece table basıyoruz
+  debtHost.innerHTML = `
+    <table class="debt-table compact">
+      <thead>
+        <tr>
+          <th>Tarih</th>
+          <th style="text-align:right;">Kalan</th>
+          <th style="text-align:right;">Birim</th>
+          <th style="text-align:right;">Tutar</th>
+          <th style="text-align:right;">İşlem</th>
+        </tr>
+      </thead>
+      <tbody>
+        ${rows}
+      </tbody>
+    </table>
+  `;
+
+  /* edit/sil */
+  debtHost.querySelectorAll("button[data-debt-act]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const id = Number(btn.dataset.id);
+      const act = btn.dataset.debtAct;
+
+      if (act === "del") {
+        deleteOrder(id, () => {
+          showToast("Sipariş Silindi ❌", "error");
+          renderDebtTable();
+        });
+      }
+
+      if (act === "edit") {
+        startEditOrder(id);
+        closeDebtModal();
+      }
+    });
+  });
+}
+
+/* ===== WhatsApp mesajı (2. görseldeki gibi) ===== */
+function pad(str, len) {
+  str = String(str);
+  return str.length >= len ? str : str + " ".repeat(len - str.length);
+}
+
+function buildDebtWhatsappMessage(list) {
+  // Mobilde satır taşmaması için "kompakt" format
+  // Ör: 16.01  6x120=720₺
+
+  const rows = list.map((o) => {
+    const d = formatDateShortTR(o.date); // 16.01.2026
+    const tarih = d.slice(0, 5); // 16.01 (kısalt)
+    const adet = Number(o.remainingQty || 0);
+    const birim = Number(o.unitPrice || 0);
+    const tutar = adet * birim;
+
+    // .00 istemiyorsan 0 yapabilirsin, şimdilik sade:
+    const birimTxt = (Math.round(birim * 100) / 100).toString();
+    const tutarTxt = (Math.round(tutar * 100) / 100).toString();
+
+    return `${tarih}  ${adet}x${birimTxt}=${tutarTxt}₺`;
+  });
+
+  const totalQty = list.reduce((s, x) => s + Number(x.remainingQty || 0), 0);
+  const totalTl = list.reduce(
+    (s, x) => s + Number(x.remainingQty || 0) * Number(x.unitPrice || 0),
+    0,
+  );
+
+  return (
+    "```" +
+    "\n" +
+    "KALAN BORCLAR\n" +
+    rows.join("\n") +
+    "\n" +
+    "----------------\n" +
+    `TOPLAM: ${totalQty} adet | ${Math.round(totalTl * 100) / 100}₺\n` +
+    "```"
+  );
+}
+
+document.getElementById("btnDebtWhatsapp")?.addEventListener("click", () => {
+  const phone = (settings.whatsapp || "").replace(/\D/g, "");
+  if (!phone || phone.length < 10) {
+    uiOpen({
+      title: "Hata",
+      subtitle: "WhatsApp numarası yok",
+      body: "Ayarlar’dan 90 ile başlayacak şekilde kaydet.",
+      okText: "Tamam",
+      showCancel: false,
+    });
+    return;
+  }
+
+  const list = getDebtItems();
+  if (list.length === 0) {
+    uiOpen({
+      title: "Bilgi",
+      subtitle: "Kalan borç yok",
+      body: "Gönderilecek liste bulunamadı.",
+      okText: "Tamam",
+      showCancel: false,
+    });
+    return;
+  }
+
+  const message = buildDebtWhatsappMessage(list);
+  openWhatsApp(phone, message);
+});
+function getTrashItems() {
+  const o = (orders || [])
+    .map((x) => ({ ...x, deletedAt: orderDeletedStamp(x) }))
+    .filter((x) => x.deletedAt)
+    .map((x) => ({ type: "order", item: x }));
+  const p = (payments || [])
+    .map((x) => ({ ...x, deletedAt: paymentDeletedStamp(x) }))
+    .filter((x) => x.deletedAt)
+    .map((x) => ({ type: "payment", item: x }));
+  // en son silinen üstte
+  return [...o, ...p].sort(
+    (a, b) => Number(b.item.deletedAt || 0) - Number(a.item.deletedAt || 0),
+  );
+}
+
+function updateTrashBadge() {
+  const n = getTrashItems().length;
+  const el = document.getElementById("trashBadgeInline");
+  if (el) el.textContent = n > 0 ? `(${n})` : "";
+}
+
+function openTrash() {
+  const m = document.getElementById("trashModal");
+  if (!m) return;
+  renderTrash();
+  m.classList.remove("hidden");
+  m.setAttribute("aria-hidden", "false");
+}
+
+function closeTrash() {
+  const m = document.getElementById("trashModal");
+  if (!m) return;
+  m.classList.add("hidden");
+  m.setAttribute("aria-hidden", "true");
+}
+
+function restoreTrash(type, id) {
+  if (type === "order") {
+    const idx = (orders || []).findIndex((x) => Number(x.id) === Number(id));
+    if (idx > -1) {
+      delete orders[idx].deletedAt;
+      orders[idx].isActive = true;
+      saveOrders(orders);
+      restoreOrderOnSheet?.(id);
+      syncOrdersFromSheet?.();
+
+      renderOrders?.();
+      renderSummary?.();
+      if (typeof renderDebtTable === "function") renderDebtTable();
+    }
+  }
+  if (type === "payment") {
+    const idx = (payments || []).findIndex((x) => Number(x.id) === Number(id));
+    if (idx > -1) {
+      delete payments[idx].deletedAt;
+      payments[idx].isActive = true;
+      savePayments(payments);
+      restorePaymentOnSheet?.(id);
+      syncOrdersFromSheet?.();
+
+      recomputePaidFromPayments?.();
+      renderPayHistory?.();
+      renderOrders?.();
+      renderSummary?.();
+      if (typeof renderDebtTable === "function") renderDebtTable();
+    }
+  }
+  showToast("Geri yüklendi ✅", "success");
+  renderTrash();
+  updateTrashBadge();
+}
+
+function purgeTrash(type, id) {
+  if (type === "order") {
+    orders = (orders || []).filter((x) => Number(x.id) !== Number(id));
+    saveOrders(orders);
+    renderOrders?.();
+    renderSummary?.();
+    if (typeof renderDebtTable === "function") renderDebtTable();
+  }
+  if (type === "payment") {
+    payments = (payments || []).filter((x) => Number(x.id) !== Number(id));
+    savePayments(payments);
+    autoBackupIfNeeded("Ödeme işlendi").catch(console.warn);
+
+    recomputePaidFromPayments?.();
+    renderPayHistory?.();
+    renderOrders?.();
+    renderSummary?.();
+    if (typeof renderDebtTable === "function") renderDebtTable();
+  }
+  showToast("Kalıcı silindi.", "info");
+  renderTrash();
+  updateTrashBadge();
+}
+
+function renderTrash() {
+  const host = document.getElementById("trashHost");
+  if (!host) return;
+
+  const list = getTrashItems();
+  if (list.length === 0) {
+    host.innerHTML = `<div style="padding:12px; color: rgba(156,163,175,.95);">Çöp kutusu boş.</div>`;
+    return;
+  }
+
+  host.innerHTML = list
+    .map((x) => {
+      const it = x.item;
+      const when = new Date(it.deletedAt || Date.now()).toLocaleString("tr-TR");
+      if (x.type === "order") {
+        const name = it.product === "damacana" ? "Damacana" : "0,5L Pet";
+        const qty = Number(it.qty || 0);
+        const total = Number(it.total || 0);
+        const sipTarih = formatDateTR(it.date);
+
+        return `
+                            <div class="trash-row">
+                            <div style="min-width:0;">
+                                <div class="trash-pill">Sipariş</div>
+                                <div class="trash-meta">${name} • ${qty} adet • ${formatMoneyTR(total)} ₺</div>
+                                <div class="trash-sub">Sipariş: ${sipTarih}<br>Silinme: ${when}</div>
+                            </div>
+                            <div class="trash-actions">
+                                <button class="mini-btn edit" data-tr-restore="${it.id}" data-tr-type="order">Geri Yükle</button>
+                                <button class="mini-btn del" data-tr-purge="${it.id}" data-tr-type="order">Kalıcı Sil</button>
+                            </div>
+                            </div>`;
+      } else {
+        const line = `${formatDateTR(it.date).split(" ")[0]} | ${Number(it.qty || 0)} adet | ${Number(it.amount || 0).toFixed(2)} ₺`;
+        const note = `Not: ${it.note || "-"}`;
+        return `
+                            <div class="trash-row">
+                                <div>
+                                <div class="trash-pill">Ödeme</div>
+                                <div class="trash-meta">${line}</div>
+                                <div class="trash-sub">${note}\nSilinme: ${when}</div>
+                                </div>
+                                <div class="trash-actions">
+                                <button class="mini-btn edit" data-tr-restore="${it.id}" data-tr-type="payment">Geri Yükle</button>
+                                <button class="mini-btn del" data-tr-purge="${it.id}" data-tr-type="payment">Kalıcı Sil</button>
+                                </div>
+                            </div>`;
+      }
+    })
+    .join("");
+
+  host.querySelectorAll("button[data-tr-restore]").forEach((b) => {
+    b.addEventListener("click", () =>
+      restoreTrash(b.dataset.trType, b.dataset.trRestore),
+    );
+  });
+  host.querySelectorAll("button[data-tr-purge]").forEach((b) => {
+    b.addEventListener("click", () =>
+      purgeTrash(b.dataset.trType, b.dataset.trPurge),
+    );
+  });
+}
+
+document.getElementById("btnOpenTrash")?.addEventListener("click", openTrash);
+document.getElementById("trashBg")?.addEventListener("click", closeTrash);
+document.getElementById("trashX")?.addEventListener("click", closeTrash);
+document.getElementById("btnTrashClose")?.addEventListener("click", closeTrash);
+
+document.getElementById("btnTrashEmpty")?.addEventListener("click", () => {
+  uiConfirm({
+    title: "Çöp Kutusu Temizlensin mi?",
+    subtitle: "Bu işlem geri alınamaz",
+    body: "Çöp kutusundaki tüm sipariş ve ödemeler kalıcı silinecek.",
+    okText: "Evet, Temizle",
+    cancelText: "Vazgeç",
+    onOk: () => {
+      orders = (orders || []).filter((x) => !orderDeletedStamp(x));
+      payments = (payments || []).filter((x) => !paymentDeletedStamp(x));
+      saveOrders(orders);
+      savePayments(payments);
+
+      recomputePaidFromPayments?.();
+      renderOrders?.();
+      renderSummary?.();
+      renderPayHistory?.();
+      if (typeof renderDebtTable === "function") renderDebtTable();
+      renderTrash();
+      updateTrashBadge();
+      showToast("Çöp kutusu temizlendi ✅", "success");
+    },
+  });
+});
+
+// sayfa açılışında sayaç güncellensin
+updateTrashBadge();
+document.querySelector(".card-settings")?.addEventListener("click", () => {
+  if (!canAccessSettings()) {
+    alert("Ayarlar sadece admin.");
+    return;
+  }
+  openSettings?.();
+});
+
+/* ================== ÖDEME MODALI (Kısmi Ödeme) ================== */
+const payModal = document.getElementById("payModal");
+
+function setTodayToPayDate() {
+  const d = new Date();
+  const yyyy = d.getFullYear();
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
+  const el = document.getElementById("payDate");
+  if (el) el.value = `${yyyy}-${mm}-${dd}`;
+}
+
+function openPayModal() {
+  if (!payModal) return;
+  setTodayToPayDate();
+
+  const q = document.getElementById("payQty");
+  const a = document.getElementById("payAmount");
+  const n = document.getElementById("payNote");
+  const info = document.getElementById("payCalcInfo");
+
+  if (q) q.value = "";
+  if (a) a.value = "";
+  if (n) n.value = "";
+  if (info) info.textContent = "";
+
+  renderPayHistory();
+  payModal.classList.remove("hidden");
+  payModal.setAttribute("aria-hidden", "false");
+
+  setTimeout(() => q?.focus(), 0);
+  renderPayAfterInfo(0);
+}
+function startEditPayment(id) {
+  const p = payments.find((x) => Number(x.id) === Number(id));
+  if (!p) return;
+
+  editingPaymentId = Number(id);
+  openPayModal();
+
+  // alanları doldur
+  const dateEl = document.getElementById("payDate");
+  if (dateEl) {
+    // date input için yyyy-mm-dd
+    const d = new Date(p.date);
+    const yyyy = d.getFullYear();
+    const mm = String(d.getMonth() + 1).padStart(2, "0");
+    const dd = String(d.getDate()).padStart(2, "0");
+    dateEl.value = `${yyyy}-${mm}-${dd}`;
+  }
+
+  const qtyEl = document.getElementById("payQty");
+  const amtEl = document.getElementById("payAmount");
+  const noteEl = document.getElementById("payNote");
+
+  if (qtyEl) qtyEl.value = Number(p.qty || 0);
+  if (amtEl) amtEl.value = Number(p.amount || 0).toFixed(2);
+  if (noteEl) noteEl.value = p.note || "";
+
+  // buton yazısı
+  const btn = document.getElementById("btnPayApply");
+  if (btn) btn.textContent = "Güncelle";
+
+  // canlı özetleri bas
+  renderPayAfterInfo(Number(p.qty || 0));
+}
+function deletePayment(id) {
+  const p = payments.find((x) => Number(x.id) === Number(id));
+  if (!p) return;
+
+  const preview =
+    `${formatDateTR(p.date).split(" ")[0]} | ${Number(p.qty || 0)} adet | ${Number(p.amount || 0).toFixed(2)} ₺
+` + `Not: ${p.note || "-"}`;
+
+  uiConfirm({
+    title: "Ödemeyi Sil",
+    subtitle:
+      "Ödeme çöp kutusuna taşınacak (istersen sonra kalıcı silebilirsin)",
+    body: preview,
+    okText: "Çöpe Taşı",
+    cancelText: "Vazgeç",
+    onOk: () => {
+      const idx = payments.findIndex((x) => Number(x.id) === Number(id));
+      if (idx === -1) return;
+
+      payments[idx].deletedAt = Date.now();
+      archivePaymentOnSheet(id); // Google'da pasife çek + dagitim geri al
+      syncOrdersFromSheet?.(); // 1 dk beklemeden hemen günceli çek
+      savePayments(payments);
+
+      // ✅ önce ödeme tablosundan düşsün, sonra tüm hesaplar güncellensin
+      renderPayHistory();
+      recomputePaidFromPayments();
+      renderOrders?.();
+      renderSummary?.();
+      if (typeof renderDebtTable === "function") renderDebtTable();
+      updateTrashBadge?.();
+
+      showToast("Ödeme çöp kutusuna taşındı 🗑️", "info");
+    },
+  });
+}
+
+function closePayModal() {
+  if (!payModal) return;
+  payModal.classList.add("hidden");
+  payModal.setAttribute("aria-hidden", "true");
+  editingPaymentId = null;
+  const btn = document.getElementById("btnPayApply");
+  if (btn) btn.textContent = "Ödeme Yap";
+}
+
+document
+  .querySelector(".card-payment")
+  ?.addEventListener("click", openPayModal);
+document.getElementById("closePayBg")?.addEventListener("click", closePayModal);
+document.getElementById("closePayX")?.addEventListener("click", closePayModal);
+document
+  .getElementById("btnPayCancel")
+  ?.addEventListener("click", closePayModal);
+
+let payLock = false;
+
+// Adet değişince -> tutar hesapla
+document.getElementById("payQty")?.addEventListener("input", () => {
+  if (payLock) return;
+  payLock = true;
+
+  const qty = Number(document.getElementById("payQty")?.value || 0);
+  const cost = fifoCostForQty(qty);
+
+  const amountEl = document.getElementById("payAmount");
+  if (amountEl) amountEl.value = qty > 0 ? cost.toFixed(2) : "";
+
+  const info = document.getElementById("payCalcInfo");
+  if (info) {
+    const maxPossible = getDebtItems().reduce(
+      (s, x) => s + Number(x.remainingQty || 0),
+      0,
+    );
+    info.textContent =
+      qty > 0
+        ? `FIFO’ya göre ${qty} adet = ${cost.toFixed(2)} ₺`
+        : `Kalan borç: ${maxPossible} adet`;
+  }
+  renderPayAfterInfo(qty);
+
+  payLock = false;
+});
+
+// Tutar değişince -> adet hesapla
+document.getElementById("payAmount")?.addEventListener("input", () => {
+  if (payLock) return;
+  payLock = true;
+
+  const amount = Number(document.getElementById("payAmount")?.value || 0);
+  const qty = fifoQtyForAmount(amount);
+  const exact = fifoCostForQty(qty);
+
+  const qtyEl = document.getElementById("payQty");
+  if (qtyEl) qtyEl.value = amount > 0 ? qty : "";
+
+  const info = document.getElementById("payCalcInfo");
+  if (info) {
+    info.textContent =
+      amount > 0
+        ? `FIFO’ya göre ${amount.toFixed(2)} ₺ → ${qty} adet (uygulanacak: ${exact.toFixed(2)} ₺)`
+        : "";
+  }
+  renderPayAfterInfo(qty);
+
+  payLock = false;
+});
+
+function renderPayHistory() {
+  const host = document.getElementById("payHistoryHost");
+  if (!host) return;
+
+  // ✅ sadece silinmeyen ödemeler görünsün
+  const visiblePayments = (payments || []).filter((p) => !paymentDeletedStamp(p));
+
+  if (!visiblePayments.length) {
+    host.innerHTML = `<div style="padding:12px; color: rgba(156,163,175,.95);">Henüz ödeme yok.</div>`;
+    return;
+  }
+
+  // ✅ en yeni en üstte
+  const sorted = visiblePayments
+    .slice()
+    .sort((a, b) => new Date(b.date) - new Date(a.date));
+
+  const rows = sorted
+    .map(
+      (p) => `
+        <tr class="pay-row" data-pay-id="${p.id}">
+            <td>${formatDateTR(p.date).split(" ")[0]}</td>
+            <td>${p.firma || ""}</td>
+            <td class="td-num">${Number(p.qty || 0)}</td>
+            <td class="td-num">${Number(p.amount || 0).toFixed(2)} ₺</td>
+            <td class="note">${p.note || ""}</td>
+            <td class="td-right">
+            <button class="ico-btn ico-del" data-pay-del="${p.id}" title="Sil">🗑️</button>
+            </td>
+        </tr>
+        `,
+    )
+    .join("");
+
+  host.innerHTML = `
+    <table class="pay-table">
+      <thead>
+        <tr>
+          <th>Tarih</th>
+          <th>Firma</th>
+          <th>Adet</th>
+          <th>Tutar</th>
+          <th>Not</th><th class="td-right">İşlem</th>
+        </tr>
+      </thead>
+      <tbody>${rows}</tbody>
+    </table>
+  `;
+
+  // satıra tıklayınca düzenle
+  host.querySelectorAll("tr.pay-row").forEach((tr) => {
+    tr.addEventListener("click", (e) => {
+      // çöp ikonuna basıldıysa satır click çalışmasın
+      if (e.target && e.target.matches("button[data-pay-del]")) return;
+      const id = Number(tr.dataset.payId);
+      startEditPayment(id);
+    });
+  });
+
+  // çöp ikonuna tıklayınca sil (çöp kutusuna taşı)
+  host.querySelectorAll("button[data-pay-del]").forEach((btn) => {
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const pid = Number(btn.dataset.payDel);
+      deletePayment(pid); // UI anında
+      archivePaymentOnSheet(pid)
+        .then(() => syncPaymentsFromSheet())
+        .catch(console.warn);
+    });
+  });
+}
+
+document.getElementById("btnPayApply")?.addEventListener("click", () => {
+  const qty = Number(document.getElementById("payQty")?.value || 0);
+  if (!qty || qty < 1) {
+    const info = document.getElementById("payCalcInfo");
+    if (info) info.textContent = "❗ Lütfen geçerli bir adet gir.";
+    return;
+  }
+
+  const dateVal = document.getElementById("payDate")?.value;
+  const dateIso = dateVal
+    ? new Date(dateVal).toISOString()
+    : new Date().toISOString();
+
+  const amount = fifoCostForQty(qty);
+  const note = String(document.getElementById("payNote")?.value || "").trim();
+
+  // 2) ödeme geçmişine kaydet
+  const firma = (settings?.firmaAdi || "").trim();
+
+  if (editingPaymentId != null) {
+    const idx = payments.findIndex(
+      (x) => Number(x.id) === Number(editingPaymentId),
+    );
+    if (idx > -1) {
+      payments[idx] = {
+        ...payments[idx],
+        date: dateIso,
+        firma,
+        qty,
+        amount: Number(document.getElementById("payAmount")?.value || amount), // kullanıcı değiştirdiyse
+        note,
+      };
+      updatePaymentOnSheet(payments[pIdx]).catch(console.warn);
+
+      savePayments(payments);
+      updatePaymentOnSheet({
+        id: Number(editingPaymentId),
+        tarih: String(dateVal || "").trim(), // yyyy-mm-dd input
+        firma,
+        adet: Number(qty || 0),
+        tutarGirilen: Number(
+          document.getElementById("payAmount")?.value || amount,
+        ),
+        not: note,
+      });
+      syncOrdersFromSheet?.();
+
+      recomputePaidFromPayments();
+      renderPayHistory();
+      editingPaymentId = null;
+
+      const btn = document.getElementById("btnPayApply");
+      if (btn) btn.textContent = "Uygula";
+      showToast("Ödeme güncellendi ✅", "success");
+
+      closePayModal();
+      return;
+    }
+  }
+  // 1) sipariş borçlarından düş (mevcut sistem)
+  applyPaymentFIFO(qty);
+  // yeni ödeme
+  payments.push({
+    id: Date.now(),
+    date: dateIso,
+    firma,
+    qty,
+    amount: Number(document.getElementById("payAmount")?.value || amount),
+    note,
+  });
+  applyPaymentOnSheet(payments[payments.length - 1]).catch(console.warn);
+  syncPaymentsFromSheet();
+
+  savePayments(payments);
+
+  recomputePaidFromPayments();
+  renderPayHistory();
+  showToast(`Ödeme işlendi ✅ (${qty} adet)`, "success");
+
+  closePayModal();
+});
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) {
+    if (sessionStorage.getItem("fromWhatsapp") === "1") {
+      sessionStorage.removeItem("fromWhatsapp");
+
+      // 👉 burada ne istiyorsan yapabilirsin
+      handleBackFromWhatsapp();
+    }
+  }
+});
+function handleBackFromWhatsapp() {
+  // açık popup varsa kapat
+  document.querySelectorAll(".modal, .popup").forEach((p) => p.remove());
+
+  showToast("WhatsApp mesajı gönderildi ✅", "success");
+  showToast("Geri hoş geldin 👋", "info");
+}
+// 🔤 Türkçe karakterleri koruyarak büyük harfe çevir
+function toTurkishUpper(str) {
+  return str
+    .replace(/i/g, "İ")
+    .replace(/ı/g, "I")
+    .replace(/ğ/g, "Ğ")
+    .replace(/ü/g, "Ü")
+    .replace(/ş/g, "Ş")
+    .replace(/ö/g, "Ö")
+    .replace(/ç/g, "Ç")
+    .toUpperCase();
+}
+document.addEventListener("input", (e) => {
+  const el = e.target;
+
+  // ❌ number, tel, email, password vs. DOKUNMA
+  if (el.tagName === "INPUT") {
+    if (
+      ["number", "tel", "email", "password", "date", "time"].includes(el.type)
+    ) {
+      return;
+    }
+  }
+
+  // ✅ SADECE text, search ve textarea
+  if (
+    (el.tagName === "INPUT" && (el.type === "text" || el.type === "search")) ||
+    el.tagName === "TEXTAREA"
+  ) {
+    const pos = el.selectionStart;
+    el.value = toTurkishUpper(el.value);
+    el.setSelectionRange(pos, pos);
+  }
+});
+
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") {
+  }
+});
+function initPayTabs() {
+  const tabs = document.getElementById("payTabs");
+  const tabPay = document.getElementById("tabPay");
+  const tabHistory = document.getElementById("tabHistory");
+  if (!tabs || !tabPay || !tabHistory) return;
+
+  function setTab(which) {
+    tabPay.classList.toggle("hidden", which !== "pay");
+    tabHistory.classList.toggle("hidden", which !== "history");
+
+    tabs.querySelectorAll(".tab-btn").forEach((btn) => {
+      btn.classList.toggle("active", btn.dataset.tab === which);
+    });
+  }
+
+  tabs.addEventListener("click", (e) => {
+    const btn = e.target.closest(".tab-btn");
+    if (!btn) return;
+    setTab(btn.dataset.tab);
+  });
+
+  // default
+  setTab("pay");
+}
+
+// Sayfa açılınca 1 kere kur
+document.addEventListener("DOMContentLoaded", initPayTabs);
+document
+  .getElementById("btnPayRefresh")
+  ?.addEventListener("click", async () => {
+    try {
+      await syncPaymentsFromSheet();
+      showToast?.("Firebase ile eşitlendi", "success");
+    } catch (e) {
+      console.warn(e);
+      showToast?.("Firebase verisi alınamadı", "error");
+    }
+  });
+
+// ✅ TEK formatHHMM (iki yerde tekrar etmeye gerek yok)
+function formatHHMM(d) {
+  const hh = String(d.getHours()).padStart(2, "0");
+  const mm = String(d.getMinutes()).padStart(2, "0");
+  return `${hh}:${mm}`;
+}
+
+// ✅ ÖDEME: Son senkron yazısı
+function setPayLastSync(dateObj) {
+  const el = document.getElementById("payLastSync");
+  if (!el) return;
+  el.textContent = `Son senkron: ${formatHHMM(dateObj)}`;
+}
+
+// ✅ SİPARİŞ: Son senkron yazısı
+function setOrdersLastSync(dateObj) {
+  const el = document.getElementById("ordersLastSyncText");
+  if (!el) return;
+  el.textContent = `Son senkron: ${formatHHMM(dateObj)}`;
+}
+
+// ✅ ÖDEME mini refresh (TEK handler)
+document
+  .getElementById("btnPayRefresh")
+  ?.addEventListener("click", async () => {
+    const btn = document.getElementById("btnPayRefresh");
+    if (!btn) return;
+
+    btn.classList.add("is-spinning");
+    try {
+      await syncPaymentsFromSheet();
+      setPayLastSync(new Date());
+      showToast?.("Firebase ile eşitlendi", "success");
+    } catch (e) {
+      console.warn(e);
+      showToast?.("Firebase verisi alınamadı", "error");
+    } finally {
+      btn.classList.remove("is-spinning");
+    }
+  });
+
+// ===== Seçili Ay Özeti Detay Aç / Kapa =====
+(function () {
+  const btn = document.getElementById("btnMonthDetailsToggle");
+  const wrap = document.getElementById("monthDetailsWrap");
+  if (!btn || !wrap) return;
+
+  // default kapalı
+  wrap.classList.add("is-hidden");
+  btn.setAttribute("aria-expanded", "false");
+
+  btn.addEventListener("click", () => {
+    const kapali = wrap.classList.toggle("is-hidden");
+    btn.setAttribute("aria-expanded", String(!kapali));
+    btn.textContent = kapali ? "Detay" : "Detay ▲";
+  });
+})();
+
+document.addEventListener("click", (e) => {
+  // drop menüler: butona veya menünün içine tıklanmadıysa kapat
+  const clickedInsideDrop = e.target.closest(".drop");
+  if (!clickedInsideDrop) closeAllDropMenus();
+
+  // accordion: summary/acc içi değilse kapat
+  const clickedInsideAcc = e.target.closest("details.acc");
+  if (!clickedInsideAcc) closeAllAccordions();
+});
+// ===============================
+// AUTO LOGOUT (inactivity timeout)
+// ===============================
+const IDLE_LIMIT_MS = 0; // Otomatik idle logout kapalı
+let _idleTimer = null;
+
+function startIdleTimer() {
+  stopIdleTimer();
+  return;
+}
+
+function stopIdleTimer() {
+  if (_idleTimer) clearTimeout(_idleTimer);
+  _idleTimer = null;
+}
+
+function bumpIdleTimer() {
+  // Otomatik idle logout kapalı.
+  return;
+}
+
+function autoLogoutDueToIdle() {
+  // Otomatik idle logout kapalı.
+  return;
+}
+  
+
+// Kullanıcının “hareket” sayılacak aksiyonları
+["mousemove", "mousedown", "keydown", "touchstart", "scroll", "click"].forEach(
+  (evt) => {
+    document.addEventListener(evt, bumpIdleTimer, { passive: true });
+  },
+);
+// ===============================
+// BACKGROUND MODE: sync pause/resume
+// ===============================
+let bgPaused = false;
+let __syncIntervals = []; // setInterval id'leri burada toplayacağız
+let __inflightAbort = null; // fetch iptal için (opsiyonel)
+
+function registerInterval(id) {
+  if (id) __syncIntervals.push(id);
+  return id;
+}
+
+function stopAllSyncIntervals() {
+  __syncIntervals.forEach((id) => {
+    try {
+      clearInterval(id);
+    } catch (e) {}
+  });
+  __syncIntervals = [];
+}
+
+// Eğer fetch ile GS sync yapıyorsan iptal edebilmek için (opsiyonel)
+function makeAbortController() {
+  try {
+    if (__inflightAbort) __inflightAbort.abort();
+  } catch (e) {}
+  __inflightAbort = new AbortController();
+  return __inflightAbort;
+}
+
+function pauseBackgroundWork() {
+  if (bgPaused) return;
+  bgPaused = true;
+
+  // ✅ AUTO REFRESH’i de durdur
+  stopAutoRefresh();
+
+  // mevcut sistemin interval’larını da durdur
+  stopAllSyncIntervals();
+
+  try {
+    inflightAbort?.abort();
+  } catch (e) {}
+}
+
+function resumeForegroundWork() {
+  if (!bgPaused) return;
+  bgPaused = false;
+
+  if (!currentUser?.username) return;
+
+  if (document.hidden) return;
+  if (document.body.classList.contains("is-locked")) return;
+
+  startAutoRefresh();
+}
+
+// Sekme görünürlüğü değişince yakala
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) pauseBackgroundWork();
+  else resumeForegroundWork();
+});
+
+// Mobilde ekstra garanti: sayfa arkaplana giderken de yakalar
+window.addEventListener("pagehide", pauseBackgroundWork);
+window.addEventListener("freeze", pauseBackgroundWork); // bazı browserlar destekler
+window.addEventListener("focus", resumeForegroundWork);
+window.addEventListener("blur", () => {
+  // blur bazen false-positive, yine de istersen kapat:
+  // pauseBackgroundWork();
+});
+if ("serviceWorker" in navigator) {
+  window.addEventListener("load", () => {
+    navigator.serviceWorker
+      .register("./service-worker.js")
+      .catch(console.error);
+  });
+}
+
+
+/* ================== FIREBASE MIGRATION BRIDGE ================== */
+const FIREBASE_WEB_CONFIG = {
+  apiKey: "AIzaSyBBOJV7zHyBw_KJwHF99DN5OYdjZD5WhyM",
+  authDomain: "susiparistakip-1b38a.firebaseapp.com",
+  databaseURL: "https://susiparistakip-1b38a-default-rtdb.europe-west1.firebasedatabase.app",
+  projectId: "susiparistakip-1b38a",
+  storageBucket: "susiparistakip-1b38a.firebasestorage.app",
+  messagingSenderId: "1001656164748",
+  appId: "1:1001656164748:web:9d26a2111bdc04038d36a9",
+  measurementId: "G-XSWWD8VWGE",
+};
+
+function getFirebaseAppSafe() {
+  if (!window.firebase || !window.firebase.initializeApp) {
+    throw new Error("Firebase script yüklenemedi.");
+  }
+  if (!window.__suSiparisFirebaseApp) {
+    window.__suSiparisFirebaseApp = window.firebase.apps?.length
+      ? window.firebase.app()
+      : window.firebase.initializeApp(FIREBASE_WEB_CONFIG);
+  }
+  return window.__suSiparisFirebaseApp;
+}
+
+function getFirebaseDbSafe() {
+  const app = getFirebaseAppSafe();
+  if (!window.__suSiparisRealtimeDb) {
+    window.__suSiparisRealtimeDb = app.database();
+  }
+  return window.__suSiparisRealtimeDb;
+}
+
+function fbRef(path = "") {
+  const db = getFirebaseDbSafe();
+  return path ? db.ref(path) : db.ref();
+}
+
+function fbSettingsRef() {
+  return fbRef("appSettings");
+}
+
+function snapshotToArray(value) {
+  if (!value || typeof value !== "object") return [];
+  return Object.entries(value).map(([id, item]) => ({
+    id: item?.id ?? (String(id).match(/^\d+$/) ? Number(id) : id),
+    ...(item || {}),
+  }));
+}
+
+function normalizeFirebaseDateText(value, fallback = "") {
+  if (!value) return fallback || "";
+  if (typeof value === "number") {
+    const d = new Date(value);
+    return Number.isNaN(d.getTime()) ? fallback || "" : d.toISOString();
+  }
+  const raw = String(value).trim();
+  if (!raw) return fallback || "";
+  if (raw.includes("T")) return raw;
+  return `${raw.slice(0, 10)}T00:00:00.000Z`;
+}
+
+function orderDocToSheetRow(data = {}) {
+  return {
+    id: Number(data.id || Date.now()),
+    tarih: normalizeFirebaseDateText(data.date, new Date().toISOString()).slice(0, 10),
+    urun: data.product === "damacana" ? "DAMACANA" : "0,5L PET",
+    adet: Number(data.qty || 0),
+    birimFiyat: Number(data.unitPrice || 0),
+    tutar: Number(data.total || 0),
+    odenenAdet: Number(data.paidQty || 0),
+    kalanAdet: Math.max(0, Number(data.qty || 0) - Number(data.paidQty || 0)),
+    durum:
+      Number(data.paidQty || 0) >= Number(data.qty || 0) ? "TAMAMLANDI" : "BEKLİYOR",
+    createdBy: String(data.createdBy || ""),
+    createdAt: data.createdAt || "",
+    deletedAt: data.deletedAt || "",
+    updatedAt: data.updatedAt || "",
+    isActive: data.isActive !== false,
+  };
+}
+
+function paymentDocToSheetRow(data = {}) {
+  return [
+    Number(data.id || 0),
+    normalizeFirebaseDateText(data.date, ""),
+    String(data.firma || ""),
+    Number(data.qty || 0),
+    Number(data.amount || 0),
+    Number((data.amountFifo ?? data.amount) || 0),
+    String(data.note || ""),
+    String(data.createdBy || ""),
+    data.createdAt || "",
+    String(data.dagitim || "[]"),
+    String(data.ozet || ""),
+    data.isActive !== false,
+    normalizeSoftDeleteTimestamp(data.deletedAt || ""),
+  ];
+}
+
+async function ensureFirebaseBootstrap() {
+  const snap = await fbSettingsRef().get();
+  if (!snap.exists()) {
+    await fbSettingsRef().set({
+      priceDamacana: Number(settings?.priceDamacana || 0),
+      pricePet05: Number(settings?.pricePet05 || 0),
+      firmaAdi: String(settings?.firmaAdi || ""),
+      whatsapp: String(settings?.whatsapp || ""),
+      migratedAt: new Date().toISOString(),
+      source: "app-bootstrap",
+    });
+  }
+}
+
+async function firebaseGetUsers() {
+  const snap = await fbRef("users").get();
+  const list = snapshotToArray(snap.exists() ? snap.val() : null);
+  return list.sort((a, b) => {
+    const aTs = new Date(a.createdAt || 0).getTime() || Number(a.createdAt || 0) || 0;
+    const bTs = new Date(b.createdAt || 0).getTime() || Number(b.createdAt || 0) || 0;
+    return aTs - bTs;
+  });
+}
+
+async function firebaseSetUsers(users = []) {
+  const existingSnap = await fbRef("users").get();
+  const existing = existingSnap.exists() ? existingSnap.val() || {} : {};
+  const nextMap = {};
+  (users || []).forEach((u, index) => {
+    const id = String(u.id ?? index + 1);
+    nextMap[id] = {
+      id: Number(u.id || index + 1),
+      username: String(u.username || "").trim(),
+      pass: String(u.pass ?? u.password ?? ""),
+      role: String(u.role || "user"),
+      status: String(u.status || "pending"),
+      createdAt: u.createdAt || new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+  });
+
+  const updates = {};
+  Object.keys(existing).forEach((id) => {
+    if (!nextMap[id]) updates[id] = null;
+  });
+  Object.entries(nextMap).forEach(([id, value]) => {
+    updates[id] = value;
+  });
+
+  await fbRef("users").update(updates);
+  return { ok: true };
+}
+
+async function firebaseGetOrders() {
+  const snap = await fbRef("orders").get();
+  const list = snapshotToArray(snap.exists() ? snap.val() : null)
+    .sort((a, b) => new Date(b.updatedAt || b.date || 0) - new Date(a.updatedAt || a.date || 0));
+  return list.map(orderDocToSheetRow);
+}
+
+async function firebaseGetPayments() {
+  const snap = await fbRef("payments").get();
+  const list = snapshotToArray(snap.exists() ? snap.val() : null)
+    .sort((a, b) => new Date(b.updatedAt || b.date || 0) - new Date(a.updatedAt || a.date || 0));
+  return list.map(paymentDocToSheetRow);
+}
+
+async function gsPost(payload) {
+  await ensureFirebaseBootstrap();
+  const action = String(payload?.action || "");
+
+  switch (action) {
+    case "getSettings": {
+      const snap = await fbSettingsRef().get();
+      const data = snap.exists() ? snap.val() : {};
+      return { ok: true, data };
+    }
+
+    case "setSettings": {
+      await fbSettingsRef().update({
+        priceDamacana: Number(payload.priceDamacana || 0),
+        pricePet05: Number(payload.pricePet05 || 0),
+        firmaAdi: String(payload.firmaAdi || "").trim(),
+        whatsapp: String(payload.whatsapp || "").trim(),
+        updatedAt: new Date().toISOString(),
+        actor: String(payload.actor || ""),
+      });
+      return { ok: true };
+    }
+
+    case "getUsers":
+      return await firebaseGetUsers();
+
+    case "setUsers":
+      await firebaseSetUsers(payload.users || []);
+      return { ok: true };
+
+    case "addUser": {
+      const users = await firebaseGetUsers();
+      const maxId = users.reduce((m, u) => Math.max(m, Number(u.id || 0)), 0);
+      const userId = String(payload.id || maxId + 1);
+      await fbRef(`users/${userId}`).set({
+        id: Number(payload.id || maxId + 1),
+        username: String(payload.username || "").trim(),
+        pass: String(payload.password || payload.pass || ""),
+        role: String(payload.role || "user"),
+        status: String(payload.status || "pending"),
+        createdAt: payload.createdAt || new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      });
+      return { ok: true };
+    }
+
+    case "setUserStatus": {
+      const users = await firebaseGetUsers();
+      const found = users.find((u) => String(u.username || "").toLowerCase() === String(payload.username || "").toLowerCase());
+      if (!found) return { ok: false, message: "Kullanıcı bulunamadı" };
+      await fbRef(`users/${String(found.id)}`).update({
+        status: String(payload.status || "pending"),
+        updatedAt: new Date().toISOString(),
+      });
+      return { ok: true };
+    }
+
+    case "setUserPassword": {
+      const users = await firebaseGetUsers();
+      const found = users.find((u) => String(u.username || "").toLowerCase() === String(payload.username || "").toLowerCase());
+      if (!found) return { ok: false, message: "Kullanıcı bulunamadı" };
+      await fbRef(`users/${String(found.id)}`).update({
+        pass: String(payload.pass || ""),
+        updatedAt: new Date().toISOString(),
+      });
+      return { ok: true };
+    }
+
+    case "getOrders":
+      return await firebaseGetOrders();
+
+    case "addOrder":
+    case "updateOrder": {
+      const orderId = String(payload.id || Date.now());
+      const qty = Number(payload.adet || 0);
+      const paidQty = Number(payload.odenenAdet || 0);
+      const unitPrice = Number(payload.birimFiyat || 0);
+      const total = Number(payload.tutar || unitPrice * qty);
+      await fbRef(`orders/${orderId}`).update({
+        id: Number(payload.id || orderId),
+        product: String(payload.urun || "").toUpperCase().includes("DAMACANA") ? "damacana" : "pet05",
+        qty,
+        paidQty,
+        unitPrice,
+        total,
+        date: normalizeFirebaseDateText(payload.tarih, new Date().toISOString()),
+        createdBy: String(payload.createdBy || payload.updatedBy || currentUser?.username || ""),
+        createdAt: payload.createdAt || new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        deletedAt: "",
+        isActive: true,
+      });
+      return { ok: true };
+    }
+
+    case "archiveOrder": {
+      await fbRef(`orders/${String(payload.id)}`).update({
+        deletedAt: new Date().toISOString(),
+        isActive: false,
+        updatedAt: new Date().toISOString(),
+        actor: String(payload.actor || ""),
+      });
+      return { ok: true };
+    }
+
+    case "restoreOrder": {
+      await fbRef(`orders/${String(payload.id)}`).update({
+        deletedAt: "",
+        isActive: true,
+        updatedAt: new Date().toISOString(),
+      });
+      return { ok: true };
+    }
+
+    case "getPayments":
+      return await firebaseGetPayments();
+
+    case "applyPayment":
+    case "updatePayment": {
+      const payId = String(payload.id || Date.now());
+      await fbRef(`payments/${payId}`).update({
+        id: Number(payload.id || payId),
+        date: normalizeFirebaseDateText(payload.tarih, new Date().toISOString()),
+        firma: String(payload.firma || ""),
+        qty: Number(payload.adet || payload.qty || 0),
+        amount: Number(payload.tutarGirilen || payload.amount || 0),
+        amountFifo: Number(payload.tutarFifo || payload.amount || payload.tutarGirilen || 0),
+        note: String(payload.not || payload.note || ""),
+        createdBy: String(payload.createdBy || payload.actor || currentUser?.username || ""),
+        createdAt: payload.createdAt || new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        dagitim: String(payload.dagitim || "[]"),
+        ozet: String(payload.ozet || payload.dagitimadet || ""),
+        isActive: payload.isActive !== false,
+      });
+      return { ok: true };
+    }
+
+    case "archivePayment": {
+      await fbRef(`payments/${String(payload.id)}`).update({
+        isActive: false,
+        deletedAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      });
+      return { ok: true };
+    }
+
+    case "restorePayment": {
+      await fbRef(`payments/${String(payload.id)}`).update({
+        isActive: true,
+        deletedAt: "",
+        updatedAt: new Date().toISOString(),
+      });
+      return { ok: true };
+    }
+
+    default:
+      throw new Error(`Firebase action tanımsız: ${action}`);
+  }
+}
+
+function updateFirebaseBadges() {
+  document.querySelectorAll('.orders-sync-title').forEach((el) => el.textContent = 'Firebase senkron');
+  document.querySelectorAll('#btnRefresh, #btnPayRefresh').forEach((btn) => {
+    if (btn?.title) btn.title = btn.title.replace('Google', 'Firebase');
+  });
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+  updateFirebaseBadges();
+});
+
+
+
+/* ================== FIREBASE ONLY REALTIME PATCH ================== */
+let __realtimeBindings = [];
+let __realtimeStartedFor = "";
+
+function __detachRealtimeBindings() {
+  (__realtimeBindings || []).forEach((off) => {
+    try { off && off(); } catch (e) {}
+  });
+  __realtimeBindings = [];
+  __realtimeStartedFor = "";
+}
+
+function __bindRealtimeValue(path, handler) {
+  const ref = fbRef(path);
+  const cb = (snap) => {
+    try {
+      handler(snap.exists() ? snap.val() : null);
+    } catch (e) {
+      console.warn("Realtime handler error:", path, e);
+    }
+  };
+  ref.on("value", cb);
+  __realtimeBindings.push(() => {
+    try { ref.off("value", cb); } catch (e) {}
+  });
+}
+
+function __applyRealtimeSettings(raw) {
+  const next = raw && typeof raw === "object" ? raw : {};
+  settings = {
+    priceDamacana: Number(next.priceDamacana || 0),
+    pricePet05: Number(next.pricePet05 || 0),
+    whatsapp: String(next.whatsapp || "90"),
+    firmaAdi: String(next.firmaAdi || ""),
+  };
+  saveSettings(settings);
+  renderSettings?.();
+  renderSummary?.();
+  if (typeof renderDebtTable === "function") renderDebtTable();
+}
+
+function __applyRealtimeUsers(raw) {
+  const list = snapshotToArray(raw)
+    .map(normalizeGsUserToLocal)
+    .filter((u) => u.username)
+    .sort((a, b) => Number(a.id || 0) - Number(b.id || 0));
+
+  __usersCache = list;
+
+  const stillExists = list.find(
+    (u) =>
+      String(u.username || "").toLowerCase() ===
+      String(currentUser?.username || "").toLowerCase()
+  );
+
+  if (currentUser?.username && !stillExists) {
+    clearSession?.();
+    currentUser = null;
+    __detachRealtimeBindings();
+    showLogin?.();
+    return;
+  }
+
+  if (stillExists) {
+    currentUser = {
+      username: stillExists.username,
+      role: stillExists.role,
+      status: stillExists.status,
+    };
+    __origSetSessionRealtimePatch(currentUser);
+  }
+
+  renderUsersTable?.();
+  renderPassiveUsers?.();
+  applyPermissions?.();
+}
+
+function __applyRealtimeOrders(raw) {
+  const list = snapshotToArray(raw)
+    .map((item) => normalizeGsOrderToLocal(orderDocToSheetRow(item)))
+    .filter((o) => o.id);
+
+  orders = list;
+  saveOrders(orders);
+  refreshPaidStateFromPaymentsOnly?.();
+  currentPage = 1;
+
+  renderOrders?.();
+  renderSummary?.();
+  if (typeof renderDebtTable === "function") renderDebtTable();
+  setOrdersLastSync?.(new Date());
+}
+
+function __applyRealtimePayments(raw) {
+  const list = snapshotToArray(raw)
+    .map((item) => normalizeGsPaymentRowToLocal(paymentDocToSheetRow(item)))
+    .filter((p) => p.id && Number(p.qty || 0) >= 0);
+
+  payments = list;
+  savePayments(payments);
+  perfInvalidate?.("payments changed");
+  recomputePaidFromPayments?.();
+  renderPayHistory?.();
+  renderSummary?.();
+  if (typeof renderDebtTable === "function") renderDebtTable();
+  setPayLastSync?.(new Date());
+}
+
+function startRealtimeSync() {
+  if (!currentUser?.username) return;
+  const sessionKey = String(currentUser.username || "").toLowerCase();
+  if (__realtimeStartedFor === sessionKey && (__realtimeBindings || []).length) return;
+
+  __detachRealtimeBindings();
+  __realtimeStartedFor = sessionKey;
+
+  __bindRealtimeValue("appSettings", __applyRealtimeSettings);
+  __bindRealtimeValue("users", __applyRealtimeUsers);
+  __bindRealtimeValue("orders", __applyRealtimeOrders);
+  __bindRealtimeValue("payments", __applyRealtimePayments);
+}
+
+function stopRealtimeSync() {
+  __detachRealtimeBindings();
+}
+
+const __origSetSessionRealtimePatch = setSession;
+setSession = function(user) {
+  const result = __origSetSessionRealtimePatch(user);
+  setTimeout(() => {
+    if (user?.username) startRealtimeSync();
+    else stopRealtimeSync();
+  }, 0);
+  return result;
+};
+
+const __origClearSessionRealtimePatch = clearSession;
+clearSession = function() {
+  stopRealtimeSync();
+  return __origClearSessionRealtimePatch();
+};
+
+const __origDoLogoutRealtimePatch = doLogout;
+doLogout = function() {
+  stopRealtimeSync();
+  return __origDoLogoutRealtimePatch();
+};
+
+startAutoRefresh = function() {
+  if (autoRefreshTimer) {
+    clearInterval(autoRefreshTimer);
+    autoRefreshTimer = null;
+  }
+};
+
+stopAutoRefresh = function() {
+  if (autoRefreshTimer) {
+    clearInterval(autoRefreshTimer);
+    autoRefreshTimer = null;
+  }
+};
+
+pauseBackgroundWork = function() {};
+resumeForegroundWork = function() {};
+
+syncOrdersFromSheet = async function (opts = {}) {
+  const silent = !!opts.silent;
+  try {
+    const list = await gsPost({ action: "getOrders" });
+    if (!Array.isArray(list))
+      throw new Error("Firebase'den sipariş listesi gelmedi");
+
+    orders = list.map(normalizeGsOrderToLocal).filter((o) => o.id);
+    saveOrders(orders);
+    refreshPaidStateFromPaymentsOnly?.();
+    setOrdersLastSync?.(new Date());
+
+    if (!silent) {
+      renderOrders?.();
+      applyPermissions?.();
+      renderSummary?.();
+      if (typeof renderDebtTable === "function") renderDebtTable();
+    }
+
+    return orders;
+  } catch (e) {
+    console.warn(e);
+    if (!silent) showToast?.("Firebase verileri alınamadı", "error");
+    return orders;
+  }
+};
+
+syncPaymentsFromSheet = async function (opts = {}) {
+  const silent = !!opts.silent;
+  try {
+    const list = await gsPost({ action: "getPayments" });
+    if (!Array.isArray(list))
+      throw new Error("Firebase'den ödeme listesi gelmedi");
+
+    payments = list.map(normalizeGsPaymentRowToLocal).filter((p) => p.id);
+    perfInvalidate("payments changed");
+    recomputePaidFromPayments?.();
+    setPayLastSync?.(new Date());
+
+    if (!silent) {
+      renderPayHistory?.();
+      renderSummary?.();
+      if (typeof renderDebtTable === "function") renderDebtTable();
+    }
+
+    return payments;
+  } catch (e) {
+    console.warn(e);
+    if (!silent) showToast?.("Firebase ödemeleri alınamadı", "error");
+    return payments;
+  }
+};
+
+syncUsersFromSheet = async function({ silent = false } = {}) {
+  try {
+    const res = await gsPost({ action: "getUsers" });
+    const list = Array.isArray(res)
+      ? res
+      : Array.isArray(res?.users)
+        ? res.users
+        : Array.isArray(res?.data)
+          ? res.data
+          : Array.isArray(res?.list)
+            ? res.list
+            : null;
+
+    if (!Array.isArray(list)) {
+      console.warn("getUsers raw:", res);
+      throw new Error("Firebase kullanıcı listesi dönmedi");
+    }
+
+    __usersCache = list.map(normalizeGsUserToLocal).filter((u) => u.username);
+    renderUsersTable?.();
+    renderPassiveUsers?.();
+    applyPermissions?.();
+    return __usersCache;
+  } catch (e) {
+    console.warn("syncUsersFromSheet hata:", e);
+    if (!silent) showToast?.("Kullanıcılar Firebase'den alınamadı", "error");
+    return __usersCache;
+  }
+};
+
+document.addEventListener("DOMContentLoaded", () => {
+  updateFirebaseBadges?.();
+
+  document.querySelectorAll(".orders-sync-title").forEach((el) => {
+    el.textContent = "Canlı Firebase bağlantısı";
+  });
+
+  document
+    .querySelectorAll("#ordersLastSyncText, #payLastSync")
+    .forEach((el) => {
+      if (el) el.textContent = "Canlı bağlantı aktif";
+    });
+
+  if (currentUser?.username) {
+    startRealtimeSync();
+  }
+});
